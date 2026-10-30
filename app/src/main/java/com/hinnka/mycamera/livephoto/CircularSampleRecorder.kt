@@ -1,7 +1,6 @@
 package com.hinnka.mycamera.livephoto
 
 import android.media.MediaCodec
-import com.hinnka.mycamera.utils.PLog
 import java.nio.ByteBuffer
 import java.util.concurrent.ConcurrentLinkedDeque
 import java.util.concurrent.ConcurrentSkipListMap
@@ -84,15 +83,15 @@ class CircularSampleRecorder(
     }
 
     private fun trimStorage() {
-        if (samples.isEmpty()) return
-
-        val lastTimestamp = samples.last().info.presentationTimeUs
+        val lastTimestamp = samples.peekLast()?.info?.presentationTimeUs ?: return
         val rollingThreshold = lastTimestamp - bufferDurationMs * 1000
         val threshold = retainedStarts.firstEntry()?.key?.let { minOf(it, rollingThreshold) }
             ?: rollingThreshold
 
-        while (samples.size > 1) {
-            val first = samples.first()
+        // ConcurrentLinkedDeque.size 会遍历整个队列，逐帧裁剪不能随保留样本增多而变慢。
+        while (true) {
+            val first = samples.peekFirst() ?: break
+            if (first === samples.peekLast()) break
             if (first.info.presentationTimeUs < threshold) {
                 samples.pollFirst()
             } else {
@@ -107,6 +106,8 @@ class CircularSampleRecorder(
     fun getLatestTimestamp(): Long? {
         return samples.peekLast()?.info?.presentationTimeUs
     }
+
+    fun getOldestTimestamp(): Long? = samples.peekFirst()?.info?.presentationTimeUs
 
     /**
      * 获取当前所有缓存的样本副本

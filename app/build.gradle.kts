@@ -26,8 +26,8 @@ android {
         applicationId = "com.hinnka.mycamera"
         minSdk = 30
         targetSdk = 36
-        versionCode = 164
-        versionName = "1.28.5"
+        versionCode = 168
+        versionName = "1.28.6"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         
@@ -63,12 +63,33 @@ android {
             keyPassword = "android"
         }
         create("release") {
-            val storeFileProp = project.findProperty("RELEASE_STORE_FILE") as? String
-            if (storeFileProp != null) {
-                storeFile = file(storeFileProp)
-                storePassword = project.findProperty("RELEASE_STORE_PASSWORD") as? String
-                keyAlias = project.findProperty("RELEASE_KEY_ALIAS") as? String
-                keyPassword = project.findProperty("RELEASE_KEY_PASSWORD") as? String
+            val propertyNames = listOf(
+                "RELEASE_STORE_FILE", "RELEASE_STORE_PASSWORD", "RELEASE_KEY_ALIAS", "RELEASE_KEY_PASSWORD"
+            )
+            val externalProperties = propertyNames.associateWith { project.findProperty(it) as? String }
+            val useExternalProperties = externalProperties.values.any { it != null }
+            val signingProperties = Properties().apply {
+                if (useExternalProperties) {
+                    propertyNames.forEach { name ->
+                        setProperty(name, requireNotNull(externalProperties[name]) { "Missing $name" })
+                    }
+                } else {
+                    val propertiesFile = rootProject.file(".signing/release.properties")
+                    if (propertiesFile.exists()) {
+                        propertiesFile.inputStream().use { load(it) }
+                        propertyNames.forEach { name -> require(containsKey(name)) { "Missing $name" } }
+                    }
+                }
+            }
+            signingProperties.getProperty("RELEASE_STORE_FILE")?.let { storeFileProp ->
+                // 外部属性沿用 app 相对路径，本地解锁配置使用仓库相对路径。
+                storeFile = if (useExternalProperties) file(storeFileProp) else rootProject.file(storeFileProp)
+                storePassword = signingProperties.getProperty("RELEASE_STORE_PASSWORD")
+                keyAlias = signingProperties.getProperty("RELEASE_KEY_ALIAS")
+                keyPassword = signingProperties.getProperty("RELEASE_KEY_PASSWORD")
+                if (!useExternalProperties) {
+                    storeType = signingProperties.getProperty("RELEASE_STORE_TYPE")
+                }
             }
         }
     }
