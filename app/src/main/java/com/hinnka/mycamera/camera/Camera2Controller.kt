@@ -756,6 +756,8 @@ class Camera2Controller(private val context: Context) {
         }
         shot.livePhotoStartTimestampUs = livePhotoVideoStartTimestampUs
         val captureSurface = shot.reader.surface
+        val includesStabilizationOutput = shot.state.useLivePhoto &&
+            !shot.continuousBurst && stabilizationImageReader != null
         // Sum the actual request plan so HDR frames with different exposures contribute
         // their own duration. Keep one timeline for the entire photo, including frame gaps.
         val estimatedDurationNs = requests.sumOf { request ->
@@ -806,6 +808,14 @@ class Camera2Controller(private val context: Context) {
                 request: CaptureRequest,
                 result: TotalCaptureResult,
             ) {
+                // 实况拍照请求也输出防抖图像，其元数据必须与循环预览帧走相同链路。
+                if (includesStabilizationOutput) {
+                    realtimeStabilizationCoordinator.submitCaptureResult(
+                        result = result,
+                        request = request,
+                        outputPhysicalCameraId = shot.physicalCameraId,
+                    )
+                }
                 val timestamp = getCaptureTimestamp(result)
                 shot.startedFrameNumbers.remove(result.frameNumber)
                 if (timestamp == null) {
@@ -3949,7 +3959,11 @@ class Camera2Controller(private val context: Context) {
         }
 
         // 8. 防抖设置
-        applyStabilizationSettings(builder, currentState, isCapture)
+        applyStabilizationSettings(
+            builder,
+            currentState,
+            isCapture = isCapture && !currentState.useLivePhoto,
+        )
 
         if (!isRawCapture) {
             // 9. 静态拍照后处理质量设置
@@ -4500,7 +4514,7 @@ class Camera2Controller(private val context: Context) {
             }
 
             // 拍摄时设置低帧率范围以支持长曝光
-            if (isCapture && state.captureMode == CaptureMode.PHOTO) {
+            if (isCapture && state.captureMode == CaptureMode.PHOTO && !state.useLivePhoto) {
                 try {
                     val characteristics = getActiveOpenCameraCharacteristics() ?: return
                     val availableFpsRanges =
@@ -5158,7 +5172,7 @@ class Camera2Controller(private val context: Context) {
         state: CameraState,
         isCapture: Boolean
     ) {
-        if (!isCapture || state.captureMode != CaptureMode.PHOTO) {
+        if (!isCapture || state.captureMode != CaptureMode.PHOTO || state.useLivePhoto) {
             applyFastStillPostProcessingSettings(builder)
             return
         }
@@ -7965,6 +7979,31 @@ class Camera2Controller(private val context: Context) {
         )
     }
 
+    private fun createPhotoCaptureRequestBuilder(
+        device: CameraDevice,
+        reader: ImageReader,
+        state: CameraState,
+    ): CaptureRequest.Builder {
+        val template = if (state.useLivePhoto) {
+            CameraDevice.TEMPLATE_VIDEO_SNAPSHOT
+        } else {
+            CameraDevice.TEMPLATE_STILL_CAPTURE
+        }
+        return device.createCaptureRequest(template).apply {
+            addTarget(reader.surface)
+            if (state.useLivePhoto) {
+                // 编码器消费经过 LUT 渲染的预览纹理，需持续输出包括 EIS YUV 在内的所有预览流。
+                // OES 输出使用视频抓拍意图；普通静态拍照请求受 HAL 缓冲兼容性限制，仍只输出照片。
+                val preview = checkNotNull(previewRequestBuilder)
+                addTarget(checkNotNull(previewSurface))
+                stabilizationImageReader?.surface?.let { addTarget(it) }
+                preview.get(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE)?.let {
+                    set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, it)
+                }
+            }
+        }
+    }
+
     private fun buildMultiFrameShortCaptureRequest(
         device: CameraDevice,
         reader: ImageReader,
@@ -7973,9 +8012,8 @@ class Camera2Controller(private val context: Context) {
         baseRequest: CaptureRequest,
         isRawCapture: Boolean,
     ): CaptureRequest {
-        return device.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE).apply {
-            addTarget(reader.surface)
-            applyBaseCameraSettings(this, isCapture = true, isRawCapture = isRawCapture)
+        return createPhotoCaptureRequestBuilder(device, reader, state).apply {
+            applyBaseCameraSettings(this, isCapture = true, isRawCapture = isRawCapture, currentState = state)
             setAePrecaptureTriggerIfSupported(
                 this,
                 CaptureRequest.CONTROL_AE_PRECAPTURE_TRIGGER_IDLE,
@@ -8077,9 +8115,8 @@ class Camera2Controller(private val context: Context) {
         baseRequest: CaptureRequest,
         isRawCapture: Boolean,
     ): CaptureRequest? {
-        val builder = device.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE).apply {
-            addTarget(reader.surface)
-            applyBaseCameraSettings(this, isCapture = true, isRawCapture = isRawCapture)
+        val builder = createPhotoCaptureRequestBuilder(device, reader, state).apply {
+            applyBaseCameraSettings(this, isCapture = true, isRawCapture = isRawCapture, currentState = state)
             setAePrecaptureTriggerIfSupported(
                 this,
                 CaptureRequest.CONTROL_AE_PRECAPTURE_TRIGGER_IDLE,
@@ -8248,16 +8285,7 @@ class Camera2Controller(private val context: Context) {
             val session = captureSession
                 ?: throw IllegalStateException("Capture session unavailable")
 
-            val captureBuilder = device.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE).apply {
-                addTarget(reader.surface)
-
-                // Do not mirror still capture frames to the GL preview SurfaceTexture.
-                // Some camera HALs occasionally deliver a still-capture buffer that
-                // SurfaceTexture.updateTexImage cannot bind as an external OES image.
-                // if (!isRawCapture && shouldMirrorStillCaptureToPreview()) {
-                //     previewSurface?.let { addTarget(it) }
-                // }
-
+            val captureBuilder = createPhotoCaptureRequestBuilder(device, reader, currentState).apply {
                 // 应用所有相机参数（曝光、白平衡、闪光灯、变焦）
                 // isCapture = true 确保使用完整的曝光时间（不限制长曝光）
                 applyBaseCameraSettings(
@@ -8321,6 +8349,8 @@ class Camera2Controller(private val context: Context) {
                 PLog.d(
                     TAG,
                     "Capture request built and ready to send: " +
+                        "livePhoto=${currentState.useLivePhoto}, " +
+                        "fps=${get(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE)}, " +
                         "aeMode=${get(CaptureRequest.CONTROL_AE_MODE)}, " +
                         "aeTrigger=${get(CaptureRequest.CONTROL_AE_PRECAPTURE_TRIGGER)}, " +
                         "aeLock=${get(CaptureRequest.CONTROL_AE_LOCK)}, " +

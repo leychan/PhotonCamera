@@ -6,6 +6,7 @@ import android.content.pm.PackageManager
 import android.media.*
 import android.opengl.*
 import android.os.Bundle
+import android.os.SystemClock
 import android.view.Surface
 import androidx.core.app.ActivityCompat
 import com.hinnka.mycamera.lut.LutConfig
@@ -165,11 +166,19 @@ class LivePhotoRecorder(
     ) {
         if (!isRunning) return
         if (!preCaptureBufferingEnabled && !acceptingTorchFrames) return
-        if (timestampNs / 1000 < (captureMinimumTimestampUs ?: Long.MIN_VALUE)) return
+        val timestampUs = timestampNs / 1000
+        if (timestampUs < (captureMinimumTimestampUs ?: Long.MIN_VALUE)) return
+        // 界面重绘可能复用同一相机帧，不重复编码相同 PTS，也不为未变化的帧伪造时间戳。
+        if (timestampUs <= lastFrameTimestampUs) return
 
-        lastFrameTimestampUs = timestampNs / 1000
+        val frameGapUs = timestampUs - lastFrameTimestampUs
+        if (lastFrameTimestampUs != 0L && frameGapUs > 3_000_000L / frameRateHz) {
+            PLog.w(TAG, "Live Photo input gap: ${frameGapUs / 1000}ms, capturing=$isCapturing")
+        }
+        lastFrameTimestampUs = timestampUs
 
         val matrix = transformMatrix.clone()
+        val queuedAtNs = SystemClock.elapsedRealtimeNanos()
         scope.launch(renderDispatcher) {
             hardwareMutex.withLock {
                 if (!isRunning) return@withLock
@@ -208,7 +217,15 @@ class LivePhotoRecorder(
                             pending.syncFrameRequested = true
                         }
                     }
-                    lutRenderer?.renderFrame(textureId, matrix, timestampNs / 1000)
+                    val renderStartedNs = SystemClock.elapsedRealtimeNanos()
+                    lutRenderer?.renderFrame(textureId, matrix, timestampUs)
+                    val renderFinishedNs = SystemClock.elapsedRealtimeNanos()
+                    val queueDelayMs = (renderStartedNs - queuedAtNs) / 1_000_000
+                    val renderDurationMs = (renderFinishedNs - renderStartedNs) / 1_000_000
+                    if (queueDelayMs > 100 || renderDurationMs > 100) {
+                        PLog.w(TAG, "Live Photo render delay: queue=${queueDelayMs}ms, " +
+                            "render=${renderDurationMs}ms, timestampUs=$timestampUs, capturing=$isCapturing")
+                    }
                 } catch (e: Exception) {
                     PLog.e(TAG, "Failed to render Live Photo frame: timestampUs=${timestampNs / 1000}", e)
                     pendingCaptureStart.get()?.ready?.completeExceptionally(e)
@@ -447,15 +464,8 @@ class LivePhotoRecorder(
         }
 
         isCapturing = true
-        val samples = circularVideoRecorder.snapshot()
-        val desiredStartUs = snapshotTimestampUs - bufferDurationMs * 1000
-        val keyframe = samples.lastOrNull {
-            it.info.presentationTimeUs <= desiredStartUs &&
-                (it.info.flags and MediaCodec.BUFFER_FLAG_KEY_FRAME) != 0
-        } ?: samples.firstOrNull {
-            (it.info.flags and MediaCodec.BUFFER_FLAG_KEY_FRAME) != 0
-        }
-        val retainedStartUs = keyframe?.info?.presentationTimeUs
+        // 仅保留现有缓存的起点；后录结束后，再在导出调度器上选择关键帧并创建样本列表。
+        val retainedStartUs = circularVideoRecorder.getOldestTimestamp()
         retainedStartUs?.let(::retainCaptureFrom)
         captureMinimumTimestampUs = retainedStartUs
         PLog.i(TAG, "Live Photo snapshot: shutter=$snapshotTimestampUs, retainedStart=$retainedStartUs")
@@ -474,7 +484,7 @@ class LivePhotoRecorder(
         val centerTs = imageTimestampUs ?: snapshotTimestampUs
         val startTimeUs = centerTs - bufferDurationMs * 1000
         val endTimeUs = centerTs + postCaptureDurationMs * 1000
-        scope.launch {
+        scope.launch(Dispatchers.IO) {
             try {
                 PLog.i(TAG, "Waiting for Live Photo post-roll: center=$centerTs, end=$endTimeUs, " +
                     "preview=$lastFrameTimestampUs, encoded=${latestEncodedVideoTimestampUs.value}, " +
