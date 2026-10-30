@@ -38,7 +38,6 @@ import com.hinnka.mycamera.model.SafeImage
 import com.hinnka.mycamera.processor.BokehStyle
 import com.hinnka.mycamera.processor.GpuBayerSource
 import com.hinnka.mycamera.processor.GpuLinearRgbSource
-import com.hinnka.mycamera.processor.PhotonSensorSizeTuning
 import com.hinnka.mycamera.processor.GpuLinearRgbStorage
 import com.hinnka.mycamera.processor.MgcSpatialOutputMode
 import com.hinnka.mycamera.processor.MgcMergeMethod
@@ -68,6 +67,9 @@ import com.hinnka.mycamera.raw.RawSharpeningDefaults
 import com.hinnka.mycamera.raw.RawAdaptiveExposureMode
 import com.hinnka.mycamera.raw.RawCaptureProfileCoordinator
 import com.hinnka.mycamera.raw.RawSceneExposureMath
+import com.hinnka.mycamera.raw.RawAppliedLensShading
+import com.hinnka.mycamera.raw.RawAppliedLensShadingMetadata
+import com.hinnka.mycamera.raw.RawDenoiseHistoryMetadata
 import com.hinnka.mycamera.raw.RawPhotonHdrMetadata
 import com.hinnka.mycamera.raw.RawProfileToneMapMode
 import com.hinnka.mycamera.raw.SpectralFilmTuning
@@ -2450,10 +2452,6 @@ object GalleryManager {
                 captureExposureCompensationEv = captureExposureCompensationEv,
             ).let(physicalRawCrop::rebase).copy(
                 exposureCompensation = captureExposureCompensationEv,
-                rawMaxQualityTuningEnabled =
-                    PhotonSensorSizeTuning.enabledFromProperties(metadata.customProperties),
-                rawMaxQualityTuningSensorAreaMm2 =
-                    PhotonSensorSizeTuning.areaFromProperties(metadata.customProperties),
             )
             val rawBuffer = image.use {
                 RawProcessor.copyRawSensorImageToContiguousBuffer(
@@ -2502,12 +2500,19 @@ object GalleryManager {
             ) ?: return@withContext
             preparedDemosaicSourceToRelease = preparedProfile.gpuDemosaicedRawSource
             updatedMetadata = updatedMetadata.copy(
-                customProperties = RawPhotonHdrMetadata.write(
-                    updatedMetadata.customProperties,
-                    preparedProfile.hdrRatio,
-                    preparedProfile.finalShortGain,
-                    preparedProfile.hdrNetPostExposureEv,
-                    preparedProfile.hdrNetInputExposureEv,
+                // Single-frame CFA keeps its gain map in the DNG; nothing is pre-applied or denoised.
+                customProperties = RawDenoiseHistoryMetadata.write(
+                    RawAppliedLensShadingMetadata.write(
+                        RawPhotonHdrMetadata.write(
+                            updatedMetadata.customProperties,
+                            preparedProfile.hdrRatio,
+                            preparedProfile.finalShortGain,
+                            preparedProfile.hdrNetPostExposureEv,
+                            preparedProfile.hdrNetInputExposureEv,
+                        ),
+                        null,
+                    ),
+                    null,
                 ),
             )
 
@@ -2583,10 +2588,6 @@ object GalleryManager {
                 rawWhiteLevelMode = updatedMetadata.rawWhiteLevelMode,
                 rawCustomWhiteLevel = updatedMetadata.rawCustomWhiteLevel,
                 sharpeningValue = rawSharpening,
-                processLocalQualityTuningEnabled =
-                    PhotonSensorSizeTuning.enabledFromProperties(updatedMetadata.customProperties),
-                processLocalQualityTuningSensorAreaMm2 =
-                    PhotonSensorSizeTuning.areaFromProperties(updatedMetadata.customProperties),
                 denoiseValue = rawNoiseReduction,
                 chromaDenoiseValue = rawChromaNoiseReduction,
                 rawDcpId = updatedMetadata.rawDcpId,
@@ -2680,10 +2681,6 @@ object GalleryManager {
                     rawWhiteLevelMode = updatedMetadata.rawWhiteLevelMode,
                     rawCustomWhiteLevel = updatedMetadata.rawCustomWhiteLevel,
                     sharpeningValue = rawSharpening,
-                    processLocalQualityTuningEnabled =
-                        PhotonSensorSizeTuning.enabledFromProperties(updatedMetadata.customProperties),
-                    processLocalQualityTuningSensorAreaMm2 =
-                        PhotonSensorSizeTuning.areaFromProperties(updatedMetadata.customProperties),
                     denoiseValue = rawNoiseReduction,
                     chromaDenoiseValue = rawChromaNoiseReduction,
                     rawDcpId = updatedMetadata.rawDcpId,
@@ -3520,10 +3517,6 @@ object GalleryManager {
                 colorSpace = RawDemosaicProcessor.getInstance().getRawColorSpace(),
             ).let(physicalRawCrop::rebase).copy(
                 exposureCompensation = captureExposureCompensationEv,
-                rawMaxQualityTuningEnabled =
-                    PhotonSensorSizeTuning.enabledFromProperties(metadata.customProperties),
-                rawMaxQualityTuningSensorAreaMm2 =
-                    PhotonSensorSizeTuning.areaFromProperties(metadata.customProperties),
             )
             val noiseProfileSelection = ContentRepository.getInstance(context)
                 .rawNoiseProfileManager
@@ -3669,9 +3662,7 @@ object GalleryManager {
             val finalStackResult = rawStackResult ?: return@withContext
             DngCaptureDiagnostics.put("merge.mergedFrameCount", finalStackResult.mergedFrameCount)
             DngCaptureDiagnostics.put("merge.outputSize", "${finalStackResult.width}x${finalStackResult.height}")
-            DngCaptureDiagnostics.put("merge.tuningSnr", finalStackResult.mgcDenoiseTuningSnr)
-            DngCaptureDiagnostics.put("merge.readNoise", finalStackResult.mgcDenoiseReadNoise?.contentToString())
-            DngCaptureDiagnostics.put("merge.shotNoise", finalStackResult.mgcDenoiseShotNoise?.contentToString())
+            DngCaptureDiagnostics.put("merge.denoiseHistory", finalStackResult.denoiseHistory?.toString())
             gpuSourceToRelease = finalStackResult.gpuLinearRgbSource
             gpuBayerSourceToRelease = finalStackResult.gpuBayerSource
             fun releaseInitialFusedBuffer() {
@@ -3702,11 +3693,7 @@ object GalleryManager {
                     stackWhiteLevel.toFloat()
                 },
                 frameCount = finalStackResult.mergedFrameCount,
-                mgcDenoiseCorrelation = finalStackResult.mgcDenoiseCorrelation,
-                mgcDenoiseReadNoise = finalStackResult.mgcDenoiseReadNoise,
-                mgcDenoiseShotNoise = finalStackResult.mgcDenoiseShotNoise,
-                mgcSpatialStrengthMap = finalStackResult.mgcSpatialStrengthMap,
-                mgcDenoiseTuningSnr = finalStackResult.mgcDenoiseTuningSnr,
+                denoiseHistory = finalStackResult.denoiseHistory,
                 mgcSharpenTuningSnr = finalStackResult.mgcSharpenTuningSnr,
                 mgcSharpenAttenuationScale =
                     finalStackResult.mgcSharpenAttenuationScale,
@@ -3728,16 +3715,11 @@ object GalleryManager {
                 else -> MgcSpatialGpuDenoiseMode.SPATIAL_DEFAULT
             }
             val defaultDenoiseModelAvailable = when (defaultDenoiseMode) {
-                MgcSpatialGpuDenoiseMode.SABRE_DEFAULT ->
-                    finalStackResult.mgcDenoiseCorrelation?.size == 128 &&
-                        finalStackResult.mgcDenoiseReadNoise?.size == 3 &&
-                        finalStackResult.mgcDenoiseShotNoise?.size == 3
+                MgcSpatialGpuDenoiseMode.SABRE_DEFAULT -> finalStackResult.denoiseHistory != null
                 MgcSpatialGpuDenoiseMode.SPATIAL_DEFAULT ->
                     MultiFrameConfig.ENABLE_MGC_SPATIAL_DEFAULT_DENOISE &&
                         !finalStackResult.mgcSpatialReferenceOnlyDiagnostic &&
-                        finalStackResult.mgcDenoiseCorrelation?.size == 128 &&
-                        finalStackResult.mgcDenoiseReadNoise?.size == 3 &&
-                        finalStackResult.mgcDenoiseShotNoise?.size == 3
+                        finalStackResult.denoiseHistory != null
                 MgcSpatialGpuDenoiseMode.BYPASS_DEFAULT_DENOISE -> true
             }
             if (defaultDenoiseRequested && !defaultDenoiseModelAvailable) {
@@ -3802,11 +3784,6 @@ object GalleryManager {
                 blackLevel = FloatArray(4),
                 whiteLevel = 65535f,
                 frameCount = 1,
-                mgcDenoiseCorrelation = null,
-                mgcDenoiseReadNoise = null,
-                mgcDenoiseShotNoise = null,
-                mgcSpatialStrengthMap = null,
-                mgcDenoiseTuningSnr = null,
             )
 
             val stackedMetadata = metadata
@@ -3897,13 +3874,36 @@ object GalleryManager {
                     PLog.e(TAG, "Failed to prepare shared RAW render/DNG profile")
                     return@withContext
                 }
+                // The persisted LinearRaw carries LSC in its pixels while its DNG drops the gain
+                // map; the denoiser needs the applied gains to undo them (docs §3.2).
+                val appliedLensShading = if (defaultDenoised.pixelsIncludeLensShadingCorrection) {
+                    RawAppliedLensShading.fromCamera2(
+                        rawMetadata.lensShadingMap,
+                        rawMetadata.lensShadingMapWidth,
+                        rawMetadata.lensShadingMapHeight,
+                    )
+                } else {
+                    null
+                }
+                appliedLensShading?.let {
+                    PLog.i(TAG, "Applied LSC persisted ${it.width}x${it.height} hash=${it.hashCode()}")
+                }
+                // Merge ratios and residual ratios of the persisted pixels (docs §2.2, §2.4).
+                val denoiseHistory = defaultDenoised.denoiseHistory
+                PLog.i(TAG, "Denoise history persisted $denoiseHistory")
                 updatedMetadata = updatedMetadata.copy(
-                    customProperties = RawPhotonHdrMetadata.write(
-                        updatedMetadata.customProperties,
-                        dngProfilePreparation.hdrRatio,
-                        dngProfilePreparation.finalShortGain,
-                        dngProfilePreparation.hdrNetPostExposureEv,
-                        dngProfilePreparation.hdrNetInputExposureEv,
+                    customProperties = RawDenoiseHistoryMetadata.write(
+                        RawAppliedLensShadingMetadata.write(
+                            RawPhotonHdrMetadata.write(
+                                updatedMetadata.customProperties,
+                                dngProfilePreparation.hdrRatio,
+                                dngProfilePreparation.finalShortGain,
+                                dngProfilePreparation.hdrNetPostExposureEv,
+                                dngProfilePreparation.hdrNetInputExposureEv,
+                            ),
+                            appliedLensShading,
+                        ),
+                        denoiseHistory,
                     ),
                 )
                 val profileElapsedMs = System.currentTimeMillis() - profileStartMs
@@ -3963,15 +3963,13 @@ object GalleryManager {
                     rawBlackPointCorrection = updatedMetadata.rawBlackPointCorrection ?: 0f,
                     rawWhitePointCorrection = updatedMetadata.rawWhitePointCorrection ?: 0f,
                     applyLensShadingCorrection = resolveRawLensShadingCorrectionEnabled(context, updatedMetadata),
+                    appliedLensShading = RawAppliedLensShadingMetadata.read(updatedMetadata.customProperties),
+                    denoiseHistory = RawDenoiseHistoryMetadata.read(updatedMetadata.customProperties),
                     rawBlackLevelMode = updatedMetadata.rawBlackLevelMode,
                     rawCustomBlackLevel = updatedMetadata.rawCustomBlackLevel,
                     rawWhiteLevelMode = updatedMetadata.rawWhiteLevelMode,
                     rawCustomWhiteLevel = updatedMetadata.rawCustomWhiteLevel,
                     sharpeningValue = rawSharpening,
-                    processLocalQualityTuningEnabled =
-                        PhotonSensorSizeTuning.enabledFromProperties(updatedMetadata.customProperties),
-                    processLocalQualityTuningSensorAreaMm2 =
-                        PhotonSensorSizeTuning.areaFromProperties(updatedMetadata.customProperties),
                     processLocalMgcSharpenTuningSnr = finalStackResult.mgcSharpenTuningSnr,
                     processLocalMgcSharpenAttenuationScale =
                         finalStackResult.mgcSharpenAttenuationScale,
@@ -4061,15 +4059,13 @@ object GalleryManager {
                         rawBlackPointCorrection = updatedMetadata.rawBlackPointCorrection ?: 0f,
                         rawWhitePointCorrection = updatedMetadata.rawWhitePointCorrection ?: 0f,
                         applyLensShadingCorrection = resolveRawLensShadingCorrectionEnabled(context, updatedMetadata),
+                        appliedLensShading = appliedLensShading,
+                        denoiseHistory = denoiseHistory,
                         rawBlackLevelMode = updatedMetadata.rawBlackLevelMode,
                         rawCustomBlackLevel = updatedMetadata.rawCustomBlackLevel,
                         rawWhiteLevelMode = updatedMetadata.rawWhiteLevelMode,
                         rawCustomWhiteLevel = updatedMetadata.rawCustomWhiteLevel,
                         sharpeningValue = rawSharpening,
-                        processLocalQualityTuningEnabled =
-                            PhotonSensorSizeTuning.enabledFromProperties(updatedMetadata.customProperties),
-                        processLocalQualityTuningSensorAreaMm2 =
-                            PhotonSensorSizeTuning.areaFromProperties(updatedMetadata.customProperties),
                         denoiseValue = rawNoiseReduction,
                         chromaDenoiseValue = rawChromaNoiseReduction,
                         rawDcpId = updatedMetadata.rawDcpId,
@@ -4358,15 +4354,13 @@ object GalleryManager {
             rawBlackPointCorrection = updatedMetadata.rawBlackPointCorrection ?: 0f,
             rawWhitePointCorrection = updatedMetadata.rawWhitePointCorrection ?: 0f,
             applyLensShadingCorrection = resolveRawLensShadingCorrectionEnabled(context, updatedMetadata),
+            appliedLensShading = RawAppliedLensShadingMetadata.read(updatedMetadata.customProperties),
+            denoiseHistory = RawDenoiseHistoryMetadata.read(updatedMetadata.customProperties),
             rawBlackLevelMode = updatedMetadata.rawBlackLevelMode,
             rawCustomBlackLevel = updatedMetadata.rawCustomBlackLevel,
             rawWhiteLevelMode = updatedMetadata.rawWhiteLevelMode,
             rawCustomWhiteLevel = updatedMetadata.rawCustomWhiteLevel,
             sharpeningValue = rawSharpening,
-            processLocalQualityTuningEnabled =
-                PhotonSensorSizeTuning.enabledFromProperties(updatedMetadata.customProperties),
-            processLocalQualityTuningSensorAreaMm2 =
-                PhotonSensorSizeTuning.areaFromProperties(updatedMetadata.customProperties),
             denoiseValue = rawNoiseReduction,
             chromaDenoiseValue = rawChromaNoiseReduction,
             rawDcpId = updatedMetadata.rawDcpId,
@@ -5888,15 +5882,13 @@ object GalleryManager {
                             rawBlackPointCorrection = updatedMetadata.rawBlackPointCorrection ?: 0f,
                             rawWhitePointCorrection = updatedMetadata.rawWhitePointCorrection ?: 0f,
                             applyLensShadingCorrection = resolveRawLensShadingCorrectionEnabled(context, updatedMetadata),
+                            appliedLensShading = RawAppliedLensShadingMetadata.read(updatedMetadata.customProperties),
+                            denoiseHistory = RawDenoiseHistoryMetadata.read(updatedMetadata.customProperties),
                             rawBlackLevelMode = updatedMetadata.rawBlackLevelMode,
                             rawCustomBlackLevel = updatedMetadata.rawCustomBlackLevel,
                             rawWhiteLevelMode = updatedMetadata.rawWhiteLevelMode,
                             rawCustomWhiteLevel = updatedMetadata.rawCustomWhiteLevel,
                             sharpeningValue = RawSharpeningDefaults.DEFAULT_STRENGTH,
-                            processLocalQualityTuningEnabled =
-                                PhotonSensorSizeTuning.enabledFromProperties(updatedMetadata.customProperties),
-                            processLocalQualityTuningSensorAreaMm2 =
-                                PhotonSensorSizeTuning.areaFromProperties(updatedMetadata.customProperties),
                             denoiseValue = rawNoiseReduction,
                             chromaDenoiseValue = rawChromaNoiseReduction,
                             rawDcpId = updatedMetadata.rawDcpId,
@@ -6067,16 +6059,14 @@ object GalleryManager {
                     rawBlackPointCorrection = updatedMetadata?.rawBlackPointCorrection ?: 0f,
                     rawWhitePointCorrection = updatedMetadata?.rawWhitePointCorrection ?: 0f,
                     applyLensShadingCorrection = resolveRawLensShadingCorrectionEnabled(context, updatedMetadata),
+                    appliedLensShading = RawAppliedLensShadingMetadata.read(rawMetadata.customProperties),
+                    denoiseHistory = RawDenoiseHistoryMetadata.read(rawMetadata.customProperties),
                     rawBlackLevelMode = updatedMetadata?.rawBlackLevelMode,
                     rawCustomBlackLevel = updatedMetadata?.rawCustomBlackLevel,
                     rawWhiteLevelMode = updatedMetadata?.rawWhiteLevelMode,
                     rawCustomWhiteLevel = updatedMetadata?.rawCustomWhiteLevel,
                     sharpeningValue = updatedMetadata?.sharpening
                         ?: RawSharpeningDefaults.DEFAULT_STRENGTH,
-                    processLocalQualityTuningEnabled =
-                        PhotonSensorSizeTuning.enabledFromProperties(updatedMetadata?.customProperties.orEmpty()),
-                    processLocalQualityTuningSensorAreaMm2 =
-                        PhotonSensorSizeTuning.areaFromProperties(updatedMetadata?.customProperties.orEmpty()),
                     denoiseValue = rawNoiseReduction,
                     chromaDenoiseValue = rawChromaNoiseReduction,
                     rawDcpId = updatedMetadata?.rawDcpId,

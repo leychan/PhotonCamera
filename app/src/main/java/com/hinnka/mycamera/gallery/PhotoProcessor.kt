@@ -23,7 +23,6 @@ import com.hinnka.mycamera.hdr.SourceKind
 import com.hinnka.mycamera.lut.ColorCorrectionPipelineResolver
 import com.hinnka.mycamera.lut.LutImageProcessor
 import com.hinnka.mycamera.lut.LutManager
-import com.hinnka.mycamera.processor.PhotonSensorSizeTuning
 import com.hinnka.mycamera.processor.DepthBokehProcessor
 import com.hinnka.mycamera.processor.BokehStyle
 import com.hinnka.mycamera.raw.RawOutputScaling
@@ -31,6 +30,8 @@ import com.hinnka.mycamera.raw.RawDigitalZoomResampling
 import com.hinnka.mycamera.raw.RawDemosaicProcessor
 import com.hinnka.mycamera.raw.RawHdrRenderResult
 import com.hinnka.mycamera.raw.RawMetadata
+import com.hinnka.mycamera.raw.RawAppliedLensShadingMetadata
+import com.hinnka.mycamera.raw.RawDenoiseHistoryMetadata
 import com.hinnka.mycamera.raw.RawPhotonHdrMetadata
 import com.hinnka.mycamera.raw.RawNoiseProfileManager
 import com.hinnka.mycamera.raw.SpectralFilmTuning
@@ -591,15 +592,13 @@ class PhotoProcessor(
             rawBlackPointCorrection = metadata.rawBlackPointCorrection ?: 0f,
             rawWhitePointCorrection = metadata.rawWhitePointCorrection ?: 0f,
             applyLensShadingCorrection = resolveRawLensShadingCorrectionEnabled(metadata),
+            appliedLensShading = RawAppliedLensShadingMetadata.read(metadata.customProperties),
+            denoiseHistory = RawDenoiseHistoryMetadata.read(metadata.customProperties),
             rawBlackLevelMode = metadata.rawBlackLevelMode,
             rawCustomBlackLevel = metadata.rawCustomBlackLevel,
             rawWhiteLevelMode = metadata.rawWhiteLevelMode,
             rawCustomWhiteLevel = metadata.rawCustomWhiteLevel,
             sharpeningValue = rawSharpening,
-            processLocalQualityTuningEnabled =
-                PhotonSensorSizeTuning.enabledFromProperties(metadata.customProperties),
-            processLocalQualityTuningSensorAreaMm2 =
-                PhotonSensorSizeTuning.areaFromProperties(metadata.customProperties),
             denoiseValue = rawNoiseReduction,
             chromaDenoiseValue = rawChromaNoiseReduction,
             rawDcpId = metadata.rawDcpId,
@@ -679,15 +678,13 @@ class PhotoProcessor(
             rawBlackPointCorrection = metadata.rawBlackPointCorrection ?: 0f,
             rawWhitePointCorrection = metadata.rawWhitePointCorrection ?: 0f,
             applyLensShadingCorrection = resolveRawLensShadingCorrectionEnabled(metadata),
+            appliedLensShading = RawAppliedLensShadingMetadata.read(metadata.customProperties),
+            denoiseHistory = RawDenoiseHistoryMetadata.read(metadata.customProperties),
             rawBlackLevelMode = metadata.rawBlackLevelMode,
             rawCustomBlackLevel = metadata.rawCustomBlackLevel,
             rawWhiteLevelMode = metadata.rawWhiteLevelMode,
             rawCustomWhiteLevel = metadata.rawCustomWhiteLevel,
             sharpeningValue = finalSharpening,
-            processLocalQualityTuningEnabled =
-                PhotonSensorSizeTuning.enabledFromProperties(metadata.customProperties),
-            processLocalQualityTuningSensorAreaMm2 =
-                PhotonSensorSizeTuning.areaFromProperties(metadata.customProperties),
             denoiseValue = finalNoiseReduction,
             chromaDenoiseValue = finalChromaNoiseReduction,
             rawDcpId = metadata.rawDcpId,

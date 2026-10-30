@@ -24,9 +24,11 @@ import com.hinnka.mycamera.camera.AspectRatio
 import com.hinnka.mycamera.camera.CameraState
 import com.hinnka.mycamera.camera.RawBlackBorderCrop
 import com.hinnka.mycamera.data.ContentRepository
-import com.hinnka.mycamera.lut.ChromaDenoiseAlgorithm
+import com.hinnka.mycamera.raw.denoise.PhotonDenoiseDump
+import com.hinnka.mycamera.raw.denoise.PhotonLensShading
+import com.hinnka.mycamera.raw.denoise.PhotonMultiScaleDenoiser
+import com.hinnka.mycamera.raw.denoise.PhotonNoiseModel
 import com.hinnka.mycamera.ml.SharedDepthEstimator
-import com.hinnka.mycamera.processor.PhotonQualitySharpenTuning
 import com.hinnka.mycamera.processor.GlesGpuCompletion
 import com.hinnka.mycamera.processor.GlesGpuScheduler
 import com.hinnka.mycamera.processor.GlesComputeWorkGroup
@@ -75,6 +77,8 @@ private data class ShadowsHighlightsParams(
 internal data class MgcSpatialGpuDenoiseResult(
     val gpuLinearRgbSource: GpuLinearRgbSource,
     val pixelsIncludeLensShadingCorrection: Boolean,
+    /** Noise state of the output pixels (docs/photon-multiscale-denoise.md §2.2, §2.4). */
+    val denoiseHistory: RawDenoiseHistory?,
 )
 
 internal enum class MgcSpatialGpuDenoiseMode {
@@ -226,15 +230,8 @@ class RawDemosaicProcessor {
             afRegions = baseMetadata?.afRegions,
             defaultCrop = defaultCrop,
             frameCount = baseMetadata?.frameCount ?: 1,
-            mgcDenoiseCorrelation = baseMetadata?.mgcDenoiseCorrelation,
-            mgcDenoiseReadNoise = baseMetadata?.mgcDenoiseReadNoise,
-            mgcDenoiseShotNoise = baseMetadata?.mgcDenoiseShotNoise,
-            mgcSpatialStrengthMap = baseMetadata?.mgcSpatialStrengthMap,
-            mgcDenoiseTuningSnr = baseMetadata?.mgcDenoiseTuningSnr,
             mgcSharpenTuningSnr = baseMetadata?.mgcSharpenTuningSnr,
             mgcSharpenAttenuationScale = baseMetadata?.mgcSharpenAttenuationScale,
-            rawMaxQualityTuningEnabled = baseMetadata?.rawMaxQualityTuningEnabled ?: false,
-            rawMaxQualityTuningSensorAreaMm2 = baseMetadata?.rawMaxQualityTuningSensorAreaMm2,
             rotation = dngRawData.rotation,
             profileGainTableMap = baseMetadata?.profileGainTableMap
         )
@@ -959,8 +956,8 @@ class RawDemosaicProcessor {
             )
             return@withContext null
         }
-        if (applyDefaultDenoise && !MgcFullResolutionDenoise.ensureInitialized(context)) {
-            PLog.e(TAG, "MGC $mode denoise kernels are unavailable")
+        if (applyDefaultDenoise && !photonDenoiser.initialize()) {
+            PLog.e(TAG, "Photon $mode denoise programs are unavailable")
             return@withContext null
         }
 
@@ -1007,10 +1004,10 @@ class RawDemosaicProcessor {
         var completed = false
         var borrowedTexture = false
         var workingFloatTexture = 0
-        var demosaicNoiseTransfer: DemosaicNoiseTransfer? = null
+        var denoisedTexture = 0
+        var outputHistory = metadata.denoiseHistory
         val totalStartNs = System.nanoTime()
         try {
-            if (applyDefaultDenoise) denoiseTransfer.prepare(width, height)
             val hasDirectFloatSource =
                 gpuLinearRgbSource?.storage == GpuLinearRgbStorage.RGBA16F
             if (!hasDirectFloatSource) {
@@ -1070,14 +1067,6 @@ class RawDemosaicProcessor {
                         } else {
                             pixelPreparationMetadata
                         }
-                        if (applyDefaultDenoise) {
-                            demosaicNoiseTransfer = checkNotNull(
-                                demosaicNoisePropagationCalibrator.measure(
-                                    quadMetadata,
-                                    demosaicCalculationWbGains(quadMetadata),
-                                ),
-                            ) { "Unable to propagate Spatial noise through Quad Bayer demosaic" }
-                        }
                         runQuadBayerDemosaic(
                             metadata = quadMetadata,
                             width = width,
@@ -1096,14 +1085,6 @@ class RawDemosaicProcessor {
                             spatialOutputNoiseMetadata(pixelPreparationMetadata)
                         } else {
                             pixelPreparationMetadata
-                        }
-                        if (applyDefaultDenoise) {
-                            demosaicNoiseTransfer = checkNotNull(
-                                demosaicNoisePropagationCalibrator.measure(
-                                    vgnMetadata,
-                                    demosaicCalculationWbGains(vgnMetadata),
-                                ),
-                            ) { "Unable to propagate Spatial noise through VGN" }
                         }
                         runStandardBayerVgnDemosaic(
                             metadata = vgnMetadata,
@@ -1154,14 +1135,6 @@ class RawDemosaicProcessor {
                     } else {
                         pixelPreparationMetadata
                     }
-                    if (applyDefaultDenoise) {
-                        demosaicNoiseTransfer = checkNotNull(
-                            demosaicNoisePropagationCalibrator.measure(
-                                quadMetadata,
-                                demosaicCalculationWbGains(quadMetadata),
-                            ),
-                        ) { "Unable to propagate Spatial noise through Quad Bayer demosaic" }
-                    }
                     runQuadBayerDemosaic(
                         metadata = quadMetadata,
                         width = width,
@@ -1190,14 +1163,6 @@ class RawDemosaicProcessor {
                     } else {
                         pixelPreparationMetadata
                     }
-                    if (applyDefaultDenoise) {
-                        demosaicNoiseTransfer = checkNotNull(
-                            demosaicNoisePropagationCalibrator.measure(
-                                vgnMetadata,
-                                demosaicCalculationWbGains(vgnMetadata),
-                            ),
-                        ) { "Unable to propagate Spatial noise through VGN" }
-                    }
                     runStandardBayerVgnDemosaic(
                         metadata = vgnMetadata,
                         width = width,
@@ -1215,77 +1180,52 @@ class RawDemosaicProcessor {
                 workingFloatTexture = demosaicTextureId
             }
             val preparationMs = (System.nanoTime() - preparationStartNs) / 1_000_000L
-            var blackBoxReadSubmitMs = 0L
-            var blackBoxParameterMs = 0L
-            var blackBoxMapWaitMs = 0L
-            var blackBoxUploadSubmitMs = 0L
-            var nativeMs = 0L
+            var denoiseMs = 0L
             if (applyDefaultDenoise) {
-                lateinit var defaultDenoiseMetadata: RawMetadata
-                lateinit var defaultDenoisePass: MgcFullResolutionDenoise.Pass
-                var tuningSnr = 0f
-                val readTiming = denoiseTransfer.read(
-                    workingFloatTexture, width, height, label = "MGC $mode default denoise",
-                    beforeMap = {
-                        val parameterStartNs = System.nanoTime()
-                        defaultDenoiseMetadata = when (mode) {
-                            MgcSpatialGpuDenoiseMode.SPATIAL_DEFAULT ->
-                                spatialOutputNoiseMetadata(denoiseMetadata)
-                            MgcSpatialGpuDenoiseMode.SABRE_DEFAULT ->
-                                sabreOutputNoiseMetadata(denoiseMetadata)
-                            MgcSpatialGpuDenoiseMode.BYPASS_DEFAULT_DENOISE ->
-                                error("Bypass mode entered the MGC default-denoise boundary")
-                        }
-                        defaultDenoisePass = when (mode) {
-                            MgcSpatialGpuDenoiseMode.SPATIAL_DEFAULT ->
-                                MgcFullResolutionDenoise.Pass.SPATIAL_DEFAULT
-                            MgcSpatialGpuDenoiseMode.SABRE_DEFAULT ->
-                                MgcFullResolutionDenoise.Pass.SABRE_DEFAULT
-                            MgcSpatialGpuDenoiseMode.BYPASS_DEFAULT_DENOISE ->
-                                error("Bypass mode has no MGC full-resolution pass")
-                        }
-                        tuningSnr = checkNotNull(metadata.mgcDenoiseTuningSnr?.takeIf {
-                            it.isFinite() && it >= 0f
-                        }) {
-                            "MGC $mode default denoise is missing output-frame SNR"
-                        }
-                        blackBoxParameterMs =
-                            (System.nanoTime() - parameterStartNs) / 1_000_000L
-                    },
-                ) { mapped ->
-                    val nativeStartNs = System.nanoTime()
-                    check(
-                        MgcFullResolutionDenoise.denoise(
-                            rgba16f = mapped,
-                            width = width,
-                            height = height,
-                            globalOriginX = 0,
-                            globalOriginY = 0,
-                            fullWidth = width,
-                            fullHeight = height,
-                            outputScale = 1f,
-                            metadata = defaultDenoiseMetadata,
-                            preparedYuvNoiseModel = demosaicNoiseTransfer.takeIf {
-                                mode == MgcSpatialGpuDenoiseMode.SPATIAL_DEFAULT
-                            },
-                            applyLensShadingToDenoiseStrength =
-                                mode == MgcSpatialGpuDenoiseMode.SABRE_DEFAULT,
-                            tuningSnr = tuningSnr,
-                            pass = defaultDenoisePass,
-                            lumaStrengthScale = resolvedLumaStrength,
-                            chromaStrengthScale = resolvedChromaStrength,
-                        )
-                    ) { "MGC $mode luma/chroma denoise failed" }
-                    nativeMs = (System.nanoTime() - nativeStartNs) / 1_000_000L
+                val history = checkNotNull(metadata.denoiseHistory) {
+                    "Photon $mode default denoise is missing the merge noise ratios"
                 }
-                blackBoxReadSubmitMs = readTiming.submitMs.toLong()
-                blackBoxMapWaitMs = readTiming.mapMs.toLong()
-
-                val returnStartNs = System.nanoTime()
-                GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, 0)
-                denoiseTransfer.upload(workingFloatTexture, width, height)
-                blackBoxUploadSubmitMs =
-                    (System.nanoTime() - returnStartNs) / 1_000_000L
+                val lensShadingSource = when {
+                    !outputIncludesLensShading || !hasLensShading -> null
+                    isBayerInput -> "demosaic"
+                    else -> "merge"
+                }
+                val lensShading = when (lensShadingSource) {
+                    "demosaic" -> PhotonLensShading.demosaic(metadata)
+                    "merge" -> RawAppliedLensShading.fromCamera2(
+                        metadata.lensShadingMap,
+                        metadata.lensShadingMapWidth,
+                        metadata.lensShadingMapHeight,
+                    )?.let(PhotonLensShading::applied)
+                    else -> null
+                }
+                val params = checkNotNull(
+                    PhotonNoiseModel.build(
+                        metadata = metadata,
+                        width = width,
+                        height = height,
+                        originX = 0,
+                        originY = 0,
+                        fullWidth = width,
+                        fullHeight = height,
+                        history = history,
+                        lumaStrength = resolvedLumaStrength,
+                        chromaStrength = resolvedChromaStrength,
+                        lensShading = lensShading,
+                    ),
+                ) { "Photon $mode default denoise has no RAW noise profile" }
+                if (PhotonDenoiseDump.enabled) {
+                    PhotonDenoiseDump.write(context, "${params.pipeline.name}_DEFAULT", workingFloatTexture,
+                        width, height, metadata, params, lensShadingSource)
+                }
+                val denoiseStartNs = System.nanoTime()
+                // §5.1: the table applied here is recorded for later passes over the output.
+                val strength = FloatArray(params.levels * RawDenoiseHistory.STRENGTH_ENTRIES)
+                denoisedTexture = checkNotNull(
+                    photonDenoiser.denoise(workingFloatTexture, width, height, params, strength),
+                ) { "Photon $mode denoise programs are unavailable" }
+                denoiseMs = (System.nanoTime() - denoiseStartNs) / 1_000_000L
+                outputHistory = params.outputHistory(strength)
             } else {
                 PLog.i(
                     TAG,
@@ -1301,7 +1241,7 @@ class RawDemosaicProcessor {
                     createdExportedTexture = true
                 }
             renderLinearRawFloatToUint(
-                sourceTextureId = workingFloatTexture,
+                sourceTextureId = if (denoisedTexture != 0) denoisedTexture else workingFloatTexture,
                 targetTextureId = exportedTexture,
                 width = width,
                 height = height,
@@ -1322,29 +1262,14 @@ class RawDemosaicProcessor {
                     "luma=$resolvedLumaStrength " +
                     "chroma=$resolvedChromaStrength " +
                     "frames=${metadata.frameCount} " +
-                    "readNoise=${metadata.mgcDenoiseReadNoise?.contentToString()} " +
-                    "shotNoise=${metadata.mgcDenoiseShotNoise?.contentToString()} " +
-                    "strengthMap=${metadata.mgcSpatialStrengthMap?.let {
-                        "${it.width}x${it.height}"
+                    "history=${outputHistory?.let {
+                        "${it.pipeline}:mergeRead=${it.mergeRead},mergeShot=${it.mergeShot}"
                     } ?: "none"} " +
                     "lscIn=$sourcePixelsIncludeLensShadingCorrection " +
                     "lscAppliedToBayer=$applyLensShadingToBayer " +
                     "lscOut=$outputIncludesLensShading " +
-                    "demosaicNoiseTransfer=${demosaicNoiseTransfer?.let {
-                        "yuvRead=${it.normalizedRead.contentToString()}," +
-                            "lumaShot=${it.normalizedLumaShot}," +
-                            "chromaShot=${it.normalizedChromaShot}"
-                    } ?: if (applyDefaultDenoise) {
-                        "analytic-rgb-to-yuv-chroma-envelope"
-                    } else {
-                        "not-applied"
-                    }} " +
                     "prepareSubmitMs=$preparationMs " +
-                    "blackBoxReadSubmitMs=$blackBoxReadSubmitMs " +
-                    "blackBoxParameterMs=$blackBoxParameterMs " +
-                    "blackBoxMapWaitMs=$blackBoxMapWaitMs " +
-                    "blackBoxUploadSubmitMs=$blackBoxUploadSubmitMs " +
-                    "nativeMs=$nativeMs gpuReturnSubmitMs=$gpuReturnSubmitMs " +
+                    "denoiseSubmitMs=$denoiseMs gpuReturnSubmitMs=$gpuReturnSubmitMs " +
                     "cpuPackMs=0 textureReuse=${!createdExportedTexture} " +
                     "result=RGBA16UI_GPU " +
                     "totalMs=${(System.nanoTime() - totalStartNs) / 1_000_000L}",
@@ -1359,6 +1284,7 @@ class RawDemosaicProcessor {
                     storage = GpuLinearRgbStorage.RGBA16UI,
                 ),
                 pixelsIncludeLensShadingCorrection = outputIncludesLensShading,
+                denoiseHistory = outputHistory,
             )
         } catch (error: Exception) {
             PLog.e(TAG, "Failed to process MGC Spatial GPU output", error)
@@ -1366,7 +1292,7 @@ class RawDemosaicProcessor {
         } finally {
             GLES30.glPixelStorei(GLES30.GL_PACK_ALIGNMENT, 1)
             GLES30.glPixelStorei(GLES30.GL_UNPACK_ALIGNMENT, 1)
-            denoiseTransfer.releaseBuffers()
+            if (denoisedTexture != 0) GLES30.glDeleteTextures(1, intArrayOf(denoisedTexture), 0)
             GLES30.glBindBuffer(GLES30.GL_PIXEL_PACK_BUFFER, 0)
             GLES30.glBindBuffer(GLES30.GL_PIXEL_UNPACK_BUFFER, 0)
             if (demosaicFramebufferId != 0 && demosaicTextureId != 0) {
@@ -1398,8 +1324,7 @@ class RawDemosaicProcessor {
 
     // Fullscreen passes own their shader programs and lifecycle.
     private val fullscreenQuad = RawFullscreenQuad()
-    private val chromaDenoiseAlgorithm = ChromaDenoiseAlgorithm(fullscreenQuad)
-    private val denoiseProfileAlgorithm = DenoiseProfileAlgorithm()
+    private val photonDenoiser = PhotonMultiScaleDenoiser()
     private val profileGainTableAlgorithm = DngPhotonProfileGainTableAlgorithm()
     private val filmicHighlightReconstructionAlgorithm =
         DarktableFilmicHighlightReconstructionAlgorithm(fullscreenQuad)
@@ -1415,7 +1340,6 @@ class RawDemosaicProcessor {
     private val srgbPass = RawSrgbPass(fullscreenQuad)
     private val sharpenPass = RawSharpenPass(fullscreenQuad)
     private val mgcSharpen = MgcSharpen()
-    private val denoiseTransfer = RawFloatTextureTransfer(RawFloatTextureTransfer.Layout.HALF)
     /** Final SDR/HDR pixels keep the RGBA16F layout all the way into the Bitmap. */
     private val outputTransfer = RawFloatTextureTransfer(RawFloatTextureTransfer.Layout.HALF)
     private var outputTransferAvailable = false
@@ -1435,37 +1359,6 @@ class RawDemosaicProcessor {
     private val legacyHighlightHistogramAlgorithm = RawLegacyHighlightHistogramAlgorithm()
     private val quadBayerDemosaicAlgorithm = QuadBayerDemosaicAlgorithm()
     private val vgnDemosaicAlgorithm = VgnDemosaicAlgorithm()
-    private val demosaicNoisePropagationCalibrator = DemosaicNoisePropagationCalibrator(
-        initializePipeline = { cfaPattern ->
-            if (RawMetadata.isQuadBayer(cfaPattern)) {
-                ensureQuadBayerPrograms()
-            } else {
-                ensureVgnPrograms()
-            }
-        },
-        renderDemosaic = { request ->
-            if (RawMetadata.isQuadBayer(request.metadata.cfaPattern)) {
-                runQuadBayerDemosaic(
-                    metadata = request.metadata,
-                    width = request.width,
-                    height = request.height,
-                    highlightReconstructionEnabled = false,
-                    rawInputTextureId = request.rawTextureId,
-                    outputTargetTextureId = request.outputTextureId,
-                )
-            } else {
-                runStandardBayerVgnDemosaic(
-                    metadata = request.metadata,
-                    width = request.width,
-                    height = request.height,
-                    highlightReconstructionEnabled = false,
-                    rawInputTextureId = request.rawTextureId,
-                    linearOutputTargetTextureId = request.linearOutputTextureId,
-                    outputTargetTextureId = request.outputTextureId,
-                )
-            }
-        },
-    )
 
     private var rawTextureId = 0
     private var rawTileTextureWidth = 0
@@ -1748,8 +1641,6 @@ class RawDemosaicProcessor {
         rawWhiteLevelMode: String? = null,
         rawCustomWhiteLevel: Float? = null,
         sharpeningValue: Float = 0f,
-        processLocalQualityTuningEnabled: Boolean? = null,
-        processLocalQualityTuningSensorAreaMm2: Float? = null,
         denoiseValue: Float? = null,
         chromaDenoiseValue: Float? = null,
         rawDcpId: String? = null,
@@ -1770,6 +1661,8 @@ class RawDemosaicProcessor {
         photonSourceToShortGain: Float? = null,
         photonHdrNetPostExposureEv: Float? = null,
         photonHdrNetInputExposureEv: Float? = null,
+        appliedLensShading: RawAppliedLensShading? = null,
+        denoiseHistory: RawDenoiseHistory? = null,
         rawCfaCorrectionMode: String? = null,
         rawBlackBorderCrop: RawBlackBorderCrop = RawBlackBorderCrop(),
         rawOutputScale: Float = 1f,
@@ -1801,8 +1694,6 @@ class RawDemosaicProcessor {
                 rawWhiteLevelMode = rawWhiteLevelMode,
                 rawCustomWhiteLevel = rawCustomWhiteLevel,
                 sharpeningValue = sharpeningValue,
-                processLocalQualityTuningEnabled = processLocalQualityTuningEnabled,
-                processLocalQualityTuningSensorAreaMm2 = processLocalQualityTuningSensorAreaMm2,
                 denoiseValue = denoiseValue,
                 chromaDenoiseValue = chromaDenoiseValue,
                 rawDcpId = rawDcpId,
@@ -1823,6 +1714,8 @@ class RawDemosaicProcessor {
                 photonSourceToShortGain = photonSourceToShortGain,
                 photonHdrNetPostExposureEv = photonHdrNetPostExposureEv,
                 photonHdrNetInputExposureEv = photonHdrNetInputExposureEv,
+                appliedLensShading = appliedLensShading,
+                denoiseHistory = denoiseHistory,
                 rawCfaCorrectionMode = rawCfaCorrectionMode,
                 rawBlackBorderCrop = rawBlackBorderCrop,
                 rawOutputScale = rawOutputScale,
@@ -1857,8 +1750,6 @@ class RawDemosaicProcessor {
         rawWhitePointCorrection: Float = 0f,
         applyLensShadingCorrection: Boolean = true,
         sharpeningValue: Float = 0f,
-        processLocalQualityTuningEnabled: Boolean? = null,
-        processLocalQualityTuningSensorAreaMm2: Float? = null,
         denoiseValue: Float? = null,
         chromaDenoiseValue: Float? = null,
         rawDcpId: String? = null,
@@ -1904,8 +1795,6 @@ class RawDemosaicProcessor {
                 rawWhitePointCorrection = rawWhitePointCorrection,
                 applyLensShadingCorrection = applyLensShadingCorrection,
                 sharpeningValue = sharpeningValue,
-                processLocalQualityTuningEnabled = processLocalQualityTuningEnabled,
-                processLocalQualityTuningSensorAreaMm2 = processLocalQualityTuningSensorAreaMm2,
                 denoiseValue = denoiseValue,
                 chromaDenoiseValue = chromaDenoiseValue,
                 rawDcpId = rawDcpId,
@@ -2011,8 +1900,6 @@ class RawDemosaicProcessor {
         rawWhiteLevelMode: String? = null,
         rawCustomWhiteLevel: Float? = null,
         sharpeningValue: Float = 0f,
-        processLocalQualityTuningEnabled: Boolean? = null,
-        processLocalQualityTuningSensorAreaMm2: Float? = null,
         processLocalMgcSharpenTuningSnr: Float? = null,
         processLocalMgcSharpenAttenuationScale: Float? = null,
         denoiseValue: Float? = null,
@@ -2040,6 +1927,8 @@ class RawDemosaicProcessor {
         photonSourceToShortGain: Float? = null,
         photonHdrNetPostExposureEv: Float? = null,
         photonHdrNetInputExposureEv: Float? = null,
+        appliedLensShading: RawAppliedLensShading? = null,
+        denoiseHistory: RawDenoiseHistory? = null,
         onMetadata: ((RawMetadata) -> Unit)? = null
     ): RawHdrRenderResult? = withContext(glDispatcher) {
         val dngFile = File(dngFilePath)
@@ -2066,8 +1955,6 @@ class RawDemosaicProcessor {
                 rawWhiteLevelMode = rawWhiteLevelMode,
                 rawCustomWhiteLevel = rawCustomWhiteLevel,
                 sharpeningValue = sharpeningValue,
-                processLocalQualityTuningEnabled = processLocalQualityTuningEnabled,
-                processLocalQualityTuningSensorAreaMm2 = processLocalQualityTuningSensorAreaMm2,
                 processLocalMgcSharpenTuningSnr = processLocalMgcSharpenTuningSnr,
                 processLocalMgcSharpenAttenuationScale = processLocalMgcSharpenAttenuationScale,
                 denoiseValue = denoiseValue,
@@ -2097,6 +1984,8 @@ class RawDemosaicProcessor {
                 photonSourceToShortGain = photonSourceToShortGain,
                 photonHdrNetPostExposureEv = photonHdrNetPostExposureEv,
                 photonHdrNetInputExposureEv = photonHdrNetInputExposureEv,
+                appliedLensShading = appliedLensShading,
+                denoiseHistory = denoiseHistory,
             )
         } catch (e: Exception) {
             PLog.e(TAG, "Failed to process RAW HDR sources: $dngFilePath", e)
@@ -2134,8 +2023,6 @@ class RawDemosaicProcessor {
         rawWhiteLevelMode: String? = null,
         rawCustomWhiteLevel: Float? = null,
         sharpeningValue: Float = 0f,
-        processLocalQualityTuningEnabled: Boolean? = null,
-        processLocalQualityTuningSensorAreaMm2: Float? = null,
         denoiseValue: Float? = null,
         chromaDenoiseValue: Float? = null,
         rawDcpId: String? = null,
@@ -2162,6 +2049,8 @@ class RawDemosaicProcessor {
         photonSourceToShortGain: Float? = null,
         photonHdrNetPostExposureEv: Float? = null,
         photonHdrNetInputExposureEv: Float? = null,
+        appliedLensShading: RawAppliedLensShading? = null,
+        denoiseHistory: RawDenoiseHistory? = null,
         onMetadata: ((RawMetadata) -> Unit)? = null,
     ): RawHdrRenderResult? = withContext(glDispatcher) {
         if ((rawData == null && gpuLinearRgbSource == null) ||
@@ -2237,8 +2126,6 @@ class RawDemosaicProcessor {
                 rawWhiteLevelMode = rawWhiteLevelMode,
                 rawCustomWhiteLevel = rawCustomWhiteLevel,
                 sharpeningValue = sharpeningValue,
-                processLocalQualityTuningEnabled = processLocalQualityTuningEnabled,
-                processLocalQualityTuningSensorAreaMm2 = processLocalQualityTuningSensorAreaMm2,
                 denoiseValue = denoiseValue,
                 chromaDenoiseValue = chromaDenoiseValue,
                 rawDcpId = rawDcpId,
@@ -2264,6 +2151,8 @@ class RawDemosaicProcessor {
                 photonSourceToShortGain = photonSourceToShortGain,
                 photonHdrNetPostExposureEv = photonHdrNetPostExposureEv,
                 photonHdrNetInputExposureEv = photonHdrNetInputExposureEv,
+                appliedLensShading = appliedLensShading,
+                denoiseHistory = denoiseHistory,
                 defaultCropIsAuthoritative = true,
             )
         } catch (e: Exception) {
@@ -2301,8 +2190,6 @@ class RawDemosaicProcessor {
         rawWhiteLevelMode: String? = null,
         rawCustomWhiteLevel: Float? = null,
         sharpeningValue: Float = 0f,
-        processLocalQualityTuningEnabled: Boolean? = null,
-        processLocalQualityTuningSensorAreaMm2: Float? = null,
         processLocalMgcSharpenTuningSnr: Float? = null,
         processLocalMgcSharpenAttenuationScale: Float? = null,
         denoiseValue: Float? = null,
@@ -2325,6 +2212,8 @@ class RawDemosaicProcessor {
         photonSourceToShortGain: Float? = null,
         photonHdrNetPostExposureEv: Float? = null,
         photonHdrNetInputExposureEv: Float? = null,
+        appliedLensShading: RawAppliedLensShading? = null,
+        denoiseHistory: RawDenoiseHistory? = null,
         rawCfaCorrectionMode: String? = null,
         rawBlackBorderCrop: RawBlackBorderCrop = RawBlackBorderCrop(),
         rawOutputScale: Float = 1f,
@@ -2509,11 +2398,6 @@ class RawDemosaicProcessor {
                 // A persisted DNG is a new editing source. Spatial merge state is consumed only
                 // by the pre-write default pass and must never leak into later slider edits.
                 frameCount = 1,
-                mgcDenoiseCorrelation = null,
-                mgcDenoiseReadNoise = null,
-                mgcDenoiseShotNoise = null,
-                mgcSpatialStrengthMap = null,
-                mgcDenoiseTuningSnr = null,
                 mgcSharpenTuningSnr = processLocalMgcSharpenTuningSnr,
                 mgcSharpenAttenuationScale =
                     processLocalMgcSharpenAttenuationScale,
@@ -2572,12 +2456,18 @@ class RawDemosaicProcessor {
                 .rawNoiseProfileManager
                 .resolveSelection(rawNoiseProfileId, actualMetadata),
         )
-        actualMetadata = actualMetadata?.let {
-            it.copy(
-                rawMaxQualityTuningEnabled =
-                    processLocalQualityTuningEnabled ?: it.rawMaxQualityTuningEnabled,
-                rawMaxQualityTuningSensorAreaMm2 =
-                    processLocalQualityTuningSensorAreaMm2 ?: it.rawMaxQualityTuningSensorAreaMm2,
+        // Gains already in the pixels are independent of the user's LSC preference, which only
+        // governs the gain map still to be applied (docs/photon-multiscale-denoise.md §3.2).
+        if (denoiseHistory != null) {
+            actualMetadata = actualMetadata?.copy(denoiseHistory = denoiseHistory)
+            PLog.i(TAG, "Denoise history restored $denoiseHistory")
+        }
+        if (appliedLensShading != null) {
+            actualMetadata = actualMetadata?.copy(appliedLensShading = appliedLensShading)
+            PLog.i(
+                TAG,
+                "Applied LSC restored ${appliedLensShading.width}x${appliedLensShading.height} " +
+                    "hash=${appliedLensShading.hashCode()}",
             )
         }
         val captureProfilePass = sceneExposureRequest != null ||
@@ -2908,9 +2798,6 @@ class RawDemosaicProcessor {
                 )
                 return@withContext null
             }
-            var userAdjustmentNoiseTransfer: DemosaicNoiseTransfer? = null
-            val userAdjustmentDenoiseEnabled =
-                (denoiseValue ?: 0f) > 0f || (chromaDenoiseValue ?: 0f) > 0f
             if (rawRenderTiles.isEmpty()) {
                 when {
                     useHalfResolutionMeteringDemosaic -> setupFullResFramebuffer(
@@ -3217,13 +3104,6 @@ class RawDemosaicProcessor {
                         "Reusing capture-profile full-resolution demosaic: " +
                             "${demosaicWidth}x$demosaicHeight texture=$demosaicTextureId",
                     )
-                    if (userAdjustmentDenoiseEnabled) {
-                        userAdjustmentNoiseTransfer =
-                            demosaicNoisePropagationCalibrator.prepareUserAdjustment(
-                                actualMetadata,
-                                demosaicCalculationWbGains(actualMetadata),
-                            )
-                    }
                 } else if (useHalfResolutionMeteringDemosaic) {
                     runHalfResolutionMeteringDemosaic(
                         metadata = actualMetadata,
@@ -3256,13 +3136,6 @@ class RawDemosaicProcessor {
                     // darktable feeds Filmic after the raw highlight reconstruction module;
                     // keep the raw-domain repair enabled before Filmic HR.
                     val rawDomainHighlightReconstructionEnabled = true
-                    if (!captureProfilePreparationRequested && userAdjustmentDenoiseEnabled) {
-                        userAdjustmentNoiseTransfer =
-                            demosaicNoisePropagationCalibrator.prepareUserAdjustment(
-                                actualMetadata,
-                                demosaicCalculationWbGains(actualMetadata),
-                            )
-                    }
                     PLog.i(
                         TAG,
                         "RAW fused input layout=CFA frameCount=${actualMetadata.frameCount} " +
@@ -3896,35 +3769,19 @@ class RawDemosaicProcessor {
                 )
             }
 
-            val denoiseProfileTextureId = renderMgcUserAdjustmentDenoise(
+            val denoiseProfileTextureId = renderPhotonUserAdjustmentDenoise(
                 context = context.applicationContext,
                 sourceTextureId = demosaicTextureId,
                 width = actualWidth,
                 height = actualHeight,
                 metadata = actualMetadata,
-                demosaicNoiseTransfer = userAdjustmentNoiseTransfer,
                 denoiseValue = denoiseValue,
                 chromaDenoiseValue = chromaDenoiseValue,
                 globalOriginX = 0,
                 globalOriginY = 0,
                 fullImageWidth = actualWidth,
                 fullImageHeight = actualHeight,
-            ) ?: run {
-                val fallbackChromaTextureId = renderDefaultChromaDenoise(
-                    sourceTextureId = demosaicTextureId,
-                    width = actualWidth,
-                    height = actualHeight,
-                    metadata = actualMetadata,
-                    chromaDenoiseValue = chromaDenoiseValue,
-                )
-                renderDenoiseProfilePass(
-                    sourceTextureId = fallbackChromaTextureId,
-                    width = actualWidth,
-                    height = actualHeight,
-                    metadata = actualMetadata,
-                    denoiseValue = denoiseValue,
-                )
-            }
+            )
             // AdobeCurve keeps BaselineExposure for the DNG SDK exposure ramp. HNCS consumes
             // it through ColorCorrectAll's camera-domain inputEV; other linear engines retain
             // the exact post-matrix 2^EV gain.
@@ -4483,20 +4340,7 @@ class RawDemosaicProcessor {
         )
 
         var completed = false
-        var userAdjustmentNoiseTransfer: DemosaicNoiseTransfer? = null
-        val userAdjustmentDenoiseEnabled =
-            (config.denoiseValue ?: 0f) > 0f || (config.chromaDenoiseValue ?: 0f) > 0f
         try {
-            if (userAdjustmentDenoiseEnabled && config.samplesPerPixel == 1) {
-                // The calibration atlas runs once. Do not retain its 1024x256 intermediates in
-                // the full-size tile pool for the remainder of this render.
-                vgnDemosaicAlgorithm.setTileTexturePoolingEnabled(false)
-                userAdjustmentNoiseTransfer =
-                    demosaicNoisePropagationCalibrator.prepareUserAdjustment(
-                        config.metadata,
-                        demosaicCalculationWbGains(config.metadata),
-                    )
-            }
             vgnDemosaicAlgorithm.setTileTexturePoolingEnabled(true)
             // The refine chain derives its strength from this rate, exactly like the
             // untiled path; the tiled path owns its own scope.
@@ -4561,35 +4405,19 @@ class RawDemosaicProcessor {
                     }
                 }
 
-                val denoisedTextureId = renderMgcUserAdjustmentDenoise(
+                val denoisedTextureId = renderPhotonUserAdjustmentDenoise(
                     context = config.context,
                     sourceTextureId = demosaicTextureId,
                     width = workWidth,
                     height = workHeight,
                     metadata = config.metadata,
-                    demosaicNoiseTransfer = userAdjustmentNoiseTransfer,
                     denoiseValue = config.denoiseValue,
                     chromaDenoiseValue = config.chromaDenoiseValue,
                     globalOriginX = working.left,
                     globalOriginY = working.top,
                     fullImageWidth = config.fullWidth,
                     fullImageHeight = config.fullHeight,
-                ) ?: run {
-                    val fallbackChromaTextureId = renderDefaultChromaDenoise(
-                        sourceTextureId = demosaicTextureId,
-                        width = workWidth,
-                        height = workHeight,
-                        metadata = config.metadata,
-                        chromaDenoiseValue = config.chromaDenoiseValue,
-                    )
-                    renderDenoiseProfilePass(
-                        sourceTextureId = fallbackChromaTextureId,
-                        width = workWidth,
-                        height = workHeight,
-                        metadata = config.metadata,
-                        denoiseValue = config.denoiseValue,
-                    )
-                }
+                )
                 if (usesGuidedToneUpsample(config.outputGeometry, config.colorEngine)) {
                     val resolution = config.outputGeometry.mgcFinishResolution
                     check(working.left % resolution.processingPeriod == 0 &&
@@ -5434,195 +5262,82 @@ class RawDemosaicProcessor {
         gfHeight = 0
     }
 
-    private fun renderDefaultChromaDenoise(
-        sourceTextureId: Int,
-        width: Int,
-        height: Int,
-        metadata: RawMetadata,
-        chromaDenoiseValue: Float?,
-    ): Int {
-        val strength = DenoiseStrength.clamp(chromaDenoiseValue)
-        if (strength <= 0f || width * height < 2) return sourceTextureId
-        if (linearOutputFramebufferId == 0 || linearOutputTextureId == 0) {
-            PLog.w(TAG, "RAW chroma denoise target is unavailable")
-            return sourceTextureId
-        }
-
-        setupNLMFramebuffers(width, height, setupLegacyAccumulator = false)
-        val profileGain =
-            (metadata.iso / 100f * metadata.postRawSensitivityBoost).coerceAtLeast(1f)
-        val noise = resolveChromaDenoiseNoiseModel(metadata, profileGain)
-        val output = chromaDenoiseAlgorithm.execute(
-            ChromaDenoiseAlgorithm.Input(
-                sourceTextureId = sourceTextureId,
-                guideFramebufferId = gfFboId[0],
-                guideTextureId = gfTexId[0],
-                outputFramebufferId = linearOutputFramebufferId,
-                outputTextureId = linearOutputTextureId,
-                width = width,
-                height = height,
-                strength = strength,
-                cameraRgbInput = true,
-                noiseModel = ChromaDenoiseAlgorithm.NoiseModel(
-                    redSlope = noise.redSlope,
-                    redOffset = noise.redOffset,
-                    greenSlope = noise.greenSlope,
-                    greenOffset = noise.greenOffset,
-                    blueSlope = noise.blueSlope,
-                    blueOffset = noise.blueOffset,
-                ),
-            ),
-        ) ?: return sourceTextureId
-        return output.textureId
-    }
-
     /**
-     * Executes the extracted non-AI MGC chroma pyramid and/or Pecan luma stage.
-     *
-     * Camera RGB is already lens-shading corrected by demosaic. The LSC grid is
-     * consumed only by ComputeDenoiseStrengthMaps and is never multiplied into
-     * pixels again. Chroma and luma retain independent user switches.
+     * The Photon multiscale denoiser on the user's luma / chroma strengths
+     * (docs/photon-multiscale-denoise.md §8, §10.3). [sourceTextureId] is camera RGB with the
+     * metadata's applied or demosaic LSC gains; the result is in gfTexId[1]. Without a RAW noise
+     * profile the source is returned unchanged.
      */
-    private fun renderMgcUserAdjustmentDenoise(
+    private fun renderPhotonUserAdjustmentDenoise(
         context: Context,
         sourceTextureId: Int,
         width: Int,
         height: Int,
         metadata: RawMetadata,
-        demosaicNoiseTransfer: DemosaicNoiseTransfer?,
         denoiseValue: Float?,
         chromaDenoiseValue: Float?,
         globalOriginX: Int,
         globalOriginY: Int,
         fullImageWidth: Int,
         fullImageHeight: Int,
-    ): Int? {
+    ): Int {
         val lumaStrength = DenoiseStrength.clamp(denoiseValue)
         val chromaStrength = DenoiseStrength.clamp(chromaDenoiseValue)
-        val lumaEnabled = lumaStrength > 0f
-        val chromaEnabled = chromaStrength > 0f
-        val enabled = lumaEnabled || chromaEnabled
-        if (!enabled || width * height < 2) {
+        if ((lumaStrength <= 0f && chromaStrength <= 0f) || width * height < 2) return sourceTextureId
+        check(photonDenoiser.initialize()) { "Photon denoise programs are unavailable" }
+        val appliedLensShading = metadata.appliedLensShading
+        val lensShadingSource = when {
+            appliedLensShading != null -> "merge"
+            hasValidLensShadingMap(metadata) -> "demosaic"
+            else -> null
+        }
+        val lensShading = when (lensShadingSource) {
+            "merge" -> PhotonLensShading.applied(checkNotNull(appliedLensShading))
+            "demosaic" -> PhotonLensShading.demosaic(metadata)
+            else -> null
+        }
+        val params = PhotonNoiseModel.build(
+            metadata = metadata,
+            width = width,
+            height = height,
+            originX = globalOriginX,
+            originY = globalOriginY,
+            fullWidth = fullImageWidth,
+            fullHeight = fullImageHeight,
+            history = PhotonNoiseModel.historyOf(metadata),
+            lumaStrength = lumaStrength,
+            chromaStrength = chromaStrength,
+            lensShading = lensShading,
+        ) ?: run {
+            PLog.w(TAG, "Photon denoise skipped: no RAW noise profile layout=${metadata.noiseProfileLayout}")
             return sourceTextureId
         }
-        if (!MgcFullResolutionDenoise.ensureInitialized(context)) {
-            PLog.w(TAG, "MGC RunFullResolutionDenoise is not initialized")
-            return null
+        if (PhotonDenoiseDump.enabled) {
+            PhotonDenoiseDump.write(context, "${params.pipeline.name}_USER", sourceTextureId, width, height,
+                metadata, params, lensShadingSource)
         }
-        setupNLMFramebuffers(
-            width,
-            height,
-            setupLegacyAccumulator = false,
-        )
-
+        setupNLMFramebuffers(width, height, setupLegacyAccumulator = false)
+        val startNs = System.nanoTime()
+        val denoised = checkNotNull(photonDenoiser.denoise(sourceTextureId, width, height, params)) {
+            "Photon denoise programs are unavailable"
+        }
         try {
-            denoiseTransfer.prepare(width, height)
-            renderPassthroughToTexture(sourceTextureId, width, height, gfFboId[0])
-            var nativeMs = 0L
-            var succeeded = false
-            val timing = denoiseTransfer.read(
-                gfTexId[0], width, height, label = "MGC USER_ADJUSTMENT denoise",
-            ) { readback ->
-                val nativeStartNs = System.nanoTime()
-                // Ordinary CFA RAW sources receive a measured single-frame SNR in withMgcRenderTuning().
-                // Keep the legacy coordinate only for editing sources whose layout/noise profile cannot
-                // produce that physical measurement; Spatial/Sabre defaults never enter this fallback.
-                val tuningSnr = metadata.mgcDenoiseTuningSnr ?: (
-                        metadata.iso.toFloat() / 100.0f *
-                            metadata.postRawSensitivityBoost
-                        ).coerceAtLeast(0.001f).also { fallbackSnr ->
-                        PLog.w(
-                            TAG,
-                            "MGC USER_ADJUSTMENT uses legacy tuning coordinate: " +
-                                "layout=${metadata.noiseProfileLayout} iso=${metadata.iso} " +
-                                "postRawBoost=${metadata.postRawSensitivityBoost} snr=$fallbackSnr",
-                        )
-                    }
-                succeeded = MgcFullResolutionDenoise.denoise(
-                    rgba16f = readback,
-                    width = width,
-                    height = height,
-                    globalOriginX = globalOriginX,
-                    globalOriginY = globalOriginY,
-                    fullWidth = fullImageWidth,
-                    fullHeight = fullImageHeight,
-                    metadata = metadata,
-                    preparedYuvNoiseModel = demosaicNoiseTransfer,
-                    applyLensShadingToDenoiseStrength = hasValidLensShadingMap(metadata),
-                    tuningSnr = tuningSnr,
-                    pass = MgcFullResolutionDenoise.Pass.USER_ADJUSTMENT,
-                    lumaStrengthScale = lumaStrength,
-                    chromaStrengthScale = chromaStrength,
-                )
-                nativeMs = (System.nanoTime() - nativeStartNs) / 1_000_000L
-            }
-            if (!succeeded) return null
-            GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, 0)
-            denoiseTransfer.upload(gfTexId[0], width, height)
-            renderPassthroughToTexture(
-                gfTexId[0],
-                width,
-                height,
-                gfFboId[1],
-            )
-            GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, 0)
-            GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, 0)
-            checkGlError("MGC denoise output RGB")
-            PLog.d(
-                TAG,
-                "MGC static denoise timing size=${width}x$height " +
-                    "pass=USER_ADJUSTMENT " +
-                    "luma=$lumaEnabled($lumaStrength) " +
-                    "chroma=$chromaEnabled($chromaStrength) " +
-                    "noiseTransfer=${demosaicNoiseTransfer?.let {
-                        if (RawMetadata.isQuadBayer(metadata.cfaPattern)) {
-                            "QUAD_BAYER"
-                        } else {
-                            "STANDARD_BAYER_VGN"
-                        }
-                    } ?: "identity"} " +
-                    "lscStrength=${lensShadingLogString(metadata)} " +
-                    "transferSubmitMs=${timing.submitMs} mapMs=${timing.mapMs} " +
-                    "nativeMs=$nativeMs",
-            )
-            return gfTexId[1]
+            renderPassthroughToTexture(denoised, width, height, gfFboId[1])
         } finally {
-            // Deletion waits for the queued upload that sources this buffer.
-            denoiseTransfer.releaseBuffers()
+            GLES30.glDeleteTextures(1, intArrayOf(denoised), 0)
         }
-    }
-
-    /**
-     * 渲染 darktable denoiseprofile NLM 降噪。
-     *
-     * 管线: 未白平衡 camera RGB → variance-stabilizing transform → NLM accumulate
-     * → inverse transform → 未白平衡 camera RGB (gfFboId[1])。
-     */
-    private fun renderDenoiseProfilePass(
-        sourceTextureId: Int,
-        width: Int,
-        height: Int,
-        metadata: RawMetadata,
-        denoiseValue: Float?,
-    ): Int {
-        val strength = DenoiseStrength.clamp(denoiseValue)
-        if (strength <= 0f || width * height < 2) return sourceTextureId
-        val profileGain =
-            (metadata.iso / 100f * metadata.postRawSensitivityBoost).coerceAtLeast(1f)
-        val (noiseSlope, noiseOffset) =
-            resolveDenoiseProfileNoiseModel(metadata, profileGain)
-        val wb = demosaicCalculationWbGains(metadata)
-        return denoiseProfileAlgorithm.execute(
-            DenoiseProfileAlgorithm.Input(
-                sourceTextureId = sourceTextureId,
-                width = width,
-                height = height,
-                strength = strength,
-                noiseSlope = noiseSlope,
-                noiseOffset = noiseOffset,
-                adaptiveWhiteBalance = floatArrayOf(wb[0], 1f, wb[3]),
-            ),
-        )?.textureId ?: sourceTextureId
+        GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, 0)
+        GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, 0)
+        checkGlError("Photon denoise output RGB")
+        PLog.d(
+            TAG,
+            "Photon denoise size=${width}x$height pipeline=${params.pipeline} n=${params.noiseCoordinate} " +
+                "levels=${params.levels} merge=${params.mergeRead},${params.mergeShot} " +
+                "residual0=${params.residual[0].contentToString()} " +
+                "luma=$lumaStrength chroma=$chromaStrength lsc=${lensShadingSource ?: "none"} " +
+                "submitMs=${(System.nanoTime() - startNs) / 1_000_000L}",
+        )
+        return gfTexId[1]
     }
 
     private fun renderPassthroughToTexture(
@@ -6288,58 +6003,34 @@ class RawDemosaicProcessor {
 
 
     /**
-     * Exposes Spatial AOT's already propagated output model as the noise profile of the one
-     * merged Bayer image. frameCount is one here only to prevent VGN's single-frame threshold
-     * resolver from dividing the AOT coefficients by the burst count a second time.
+     * Noise profile of the one merged Bayer image for the demosaic's thresholds: the reference
+     * frame's RAW profile scaled by the merge's §2.2 variance ratios
+     * (docs/photon-multiscale-denoise.md). frameCount is one so the demosaic's single-frame
+     * resolver does not divide by the burst count a second time.
      */
     private fun spatialOutputNoiseMetadata(metadata: RawMetadata): RawMetadata {
-        val read = checkNotNull(metadata.mgcDenoiseReadNoise) {
-            "Spatial AOT output read coefficients are unavailable"
+        val history = checkNotNull(metadata.denoiseHistory) {
+            "Spatial merge noise ratios are unavailable"
         }
-        val shot = checkNotNull(metadata.mgcDenoiseShotNoise) {
-            "Spatial AOT output shot coefficients are unavailable"
+        val noise = checkNotNull(PhotonNoiseModel.profileNoise(metadata)) {
+            "Spatial merge has no RAW noise profile"
         }
-        check(
-            read.size == 3 && shot.size == 3 &&
-                read.all { it.isFinite() && it >= 0f } &&
-                shot.all { it.isFinite() && it >= 0f } &&
-                (read.any { it > 0f } || shot.any { it > 0f }),
-        ) { "Spatial AOT output noise coefficients are malformed" }
         PLog.i(
             TAG,
-            "MGC Spatial default denoise noise source=spatial-aot " +
-                "captureFrames=${metadata.frameCount} " +
-                "read=${read.contentToString()} shot=${shot.contentToString()}",
+            "Spatial demosaic noise source=profile-merge-ratio captureFrames=${metadata.frameCount} " +
+                "mergeRead=${history.mergeRead} mergeShot=${history.mergeShot}",
         )
         return metadata.copy(
             frameCount = 1,
-            channelNoiseProfile = floatArrayOf(
-                shot[0], read[0],
-                shot[1], read[1],
-                shot[2], read[2],
-            ),
+            channelNoiseProfile = FloatArray(6) { index ->
+                val channel = index / 2
+                if (index % 2 == 0) {
+                    noise.shot[channel] * history.mergeShot
+                } else {
+                    noise.read[channel] * history.mergeRead
+                }
+            },
             noiseProfileLayout = RawNoiseProfileLayout.DNG_RGB,
-        )
-    }
-
-    /** Consume the classic Sabre merged model once, without reference-model or frame-count scaling. */
-    private fun sabreOutputNoiseMetadata(metadata: RawMetadata): RawMetadata {
-        val read = checkNotNull(metadata.mgcDenoiseReadNoise)
-        val shot = checkNotNull(metadata.mgcDenoiseShotNoise)
-        val correlation = checkNotNull(metadata.mgcDenoiseCorrelation)
-        check(read.size == 3 && shot.size == 3 && correlation.size == 128)
-        check(read.all { it.isFinite() && it >= 0f } &&
-            shot.all { it.isFinite() && it >= 0f } &&
-            correlation.all { it.isFinite() && it >= 0f })
-        PLog.i(
-            TAG,
-            "MGC Sabre default denoise noise source=classic-merged-model " +
-                "captureFrames=${metadata.frameCount} " +
-                "read=${read.contentToString()} shot=${shot.contentToString()}",
-        )
-        return metadata.copy(
-            frameCount = 1,
-            mgcSpatialStrengthMap = null,
         )
     }
 
@@ -7919,19 +7610,20 @@ class RawDemosaicProcessor {
         ) { "RAW HDR reference pass failed" }
     }
 
-    /** Share one native RAW measurement; merged captures already carry reference-frame SNR. */
+    /**
+     * One native measurement of the mean green signal (MGC EstimateSnr's mean): the MGC sharpen
+     * tuning SNR (merged captures carry the reference frame's) and the denoiser's image SNR signal
+     * (docs/photon-multiscale-denoise.md §5.1).
+     */
     private fun RawMetadata.withMgcRenderTuning(
         rawData: ByteBuffer?,
         rowStride: Int,
         samplesPerPixel: Int,
     ): RawMetadata {
-        val needsSingleFrameDenoiseSnr =
-            samplesPerPixel == 1 && frameCount == 1 && mgcDenoiseTuningSnr == null
         // Guided reconstruction is still required when the sharpening slider is zero.
         val needsSharpenSnr = mgcSharpenTuningSnr == null
-        if (!needsSingleFrameDenoiseSnr && !needsSharpenSnr) {
-            return this
-        }
+        val needsDenoiseSignal = denoiseSignal == null
+        if (!needsSharpenSnr && !needsDenoiseSignal) return this
         val signalStartNs = System.nanoTime()
         val measuredSignal = rawData?.let { estimateMgcReferenceSignal(
             rawData = it,
@@ -7942,6 +7634,8 @@ class RawDemosaicProcessor {
         // Photon does not carry MGC's unapplied gain; do not substitute display EV.
         val signal = measuredSignal ?: 0.18f
         val signalElapsedMs = (System.nanoTime() - signalStartNs) / 1_000_000L
+        val measured = if (needsDenoiseSignal && measuredSignal != null) copy(denoiseSignal = measuredSignal) else this
+        if (!needsSharpenSnr) return measured
         val noiseModel = when (noiseProfileLayout) {
             RawNoiseProfileLayout.CAMERA2_CFA ->
                 RawNoiseModel.fromCamera2NoiseProfile(channelNoiseProfile)
@@ -7976,19 +7670,10 @@ class RawDemosaicProcessor {
             TAG,
                 "MGC RAW render tuning signal=$signal snr=$snr " +
                     "greenShot=$greenShot greenRead=$greenRead " +
-                    "singleFrameDenoise=$needsSingleFrameDenoiseSnr " +
-                    "sharpen=$needsSharpenSnr " +
                     "signalSource=${if (measuredSignal != null) "NATIVE_OMP" else "MGC_MISSING_MEAN"} " +
                     "signalMs=$signalElapsedMs",
         )
-        return copy(
-            mgcSharpenTuningSnr = if (needsSharpenSnr) snr else mgcSharpenTuningSnr,
-            mgcDenoiseTuningSnr = if (needsSingleFrameDenoiseSnr && measuredSignal != null && snr > 0f) {
-                snr
-            } else {
-                mgcDenoiseTuningSnr
-            },
-        )
+        return measured.copy(mgcSharpenTuningSnr = snr)
     }
 
     private fun RawMetadata.estimateMgcReferenceSignal(
@@ -8065,7 +7750,6 @@ class RawDemosaicProcessor {
             height = metadata.height,
             snr = snr,
             attenuation = effectiveStrength,
-            tuning = PhotonQualitySharpenTuning.resolve(metadata.rawMaxQualityTuningEnabled),
         )
     }
 
@@ -9425,14 +9109,11 @@ class RawDemosaicProcessor {
         srgbPass.release()
         sharpenPass.release()
         mgcSharpen.release()
-        denoiseTransfer.release()
         raisrTransfer.release()
         outputPass.release()
         hdrReferencePass.release()
-        chromaDenoiseAlgorithm.release()
         filmicHighlightReconstructionAlgorithm.release()
 
-        demosaicNoisePropagationCalibrator.release()
         vgnDemosaicAlgorithm.release()
         quadBayerDemosaicAlgorithm.release()
         profileGainTableAlgorithm.release()
@@ -9444,7 +9125,7 @@ class RawDemosaicProcessor {
         linearUintToFloatPass.release()
         linearFloatToUintPass.release()
         linearRgbExpandPass.release()
-        denoiseProfileAlgorithm.release()
+        photonDenoiser.release()
         releaseDenoiseProfileFramebuffers()
 
         if (exportedStackTextureIds.isNotEmpty()) {

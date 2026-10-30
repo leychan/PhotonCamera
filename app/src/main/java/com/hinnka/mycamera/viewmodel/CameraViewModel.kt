@@ -64,7 +64,6 @@ import com.hinnka.mycamera.processor.CaptureProcessingQueue
 import com.hinnka.mycamera.processor.RawBurstFrameRole
 import com.hinnka.mycamera.processor.MgcSpatialOutputMode
 import com.hinnka.mycamera.processor.MgcMergeMethod
-import com.hinnka.mycamera.processor.PhotonSensorSizeTuning
 import com.hinnka.mycamera.processor.MgcRawMaxMode
 import com.hinnka.mycamera.processor.RawmaxExposurePlanner
 import com.hinnka.mycamera.processor.RawStackFrame
@@ -206,11 +205,8 @@ private fun resolveEffectiveRawAutoExposure(): Boolean = false
 
 private fun rawProcessingMetadataProperties(
     userPrefs: UserPreferences?,
-    sensorPhysicalAreaMm2: Float?,
-): Map<String, String> = PhotonSensorSizeTuning.captureProperties(
-    enabled = userPrefs?.let { it.useRawMax && it.rawMaxQualityTuningEnabled } == true,
-    sensorPhysicalAreaMm2 = sensorPhysicalAreaMm2,
-) + RawDigitalZoomResampling.captureProperties(userPrefs?.rawDigitalZoomResamplingEnabled == true)
+): Map<String, String> =
+    RawDigitalZoomResampling.captureProperties(userPrefs?.rawDigitalZoomResamplingEnabled == true)
 
 private fun resolveCaptureSharpening(
     isRawCapture: Boolean,
@@ -228,22 +224,29 @@ internal data class CaptureDenoiseStrengths(
     val bakedChroma: Float?,
 )
 
+/**
+ * RAW captures take the RAWmax luma / chroma strengths from the settings. A merge bakes them into
+ * its default denoise before the DNG is written, so its editable strengths start at 0; a single
+ * frame has no default denoise, so the same strengths become its editable initial values and the
+ * user-adjustment denoise applies them (docs/photon-multiscale-denoise.md §10.3).
+ */
 internal fun resolveCaptureDenoiseStrengths(
     isRawCapture: Boolean,
+    isMergedCapture: Boolean,
     userPrefs: UserPreferences?,
-): CaptureDenoiseStrengths = when {
-    !isRawCapture -> CaptureDenoiseStrengths(0f, 0f, null, null)
-    else -> CaptureDenoiseStrengths(
-        editableLuma = 0f,
-        editableChroma = 0f,
-        bakedLuma = RawDenoiseDefaults.normalize(
-            userPrefs?.rawMaxNoiseReduction ?: RawDenoiseDefaults.RAW_MAX_LUMA_STRENGTH
-        ),
-        bakedChroma = RawDenoiseDefaults.normalize(
-            userPrefs?.rawMaxChromaNoiseReduction
-                ?: RawDenoiseDefaults.RAW_MAX_CHROMA_STRENGTH
-        ),
+): CaptureDenoiseStrengths {
+    if (!isRawCapture) return CaptureDenoiseStrengths(0f, 0f, null, null)
+    val luma = RawDenoiseDefaults.normalize(
+        userPrefs?.rawMaxNoiseReduction ?: RawDenoiseDefaults.RAW_MAX_LUMA_STRENGTH
     )
+    val chroma = RawDenoiseDefaults.normalize(
+        userPrefs?.rawMaxChromaNoiseReduction ?: RawDenoiseDefaults.RAW_MAX_CHROMA_STRENGTH
+    )
+    return if (isMergedCapture) {
+        CaptureDenoiseStrengths(editableLuma = 0f, editableChroma = 0f, bakedLuma = luma, bakedChroma = chroma)
+    } else {
+        CaptureDenoiseStrengths(editableLuma = luma, editableChroma = chroma, bakedLuma = null, bakedChroma = null)
+    }
 }
 
 private fun ColorRecipeParams.withoutIndependentEffects(): ColorRecipeParams {
@@ -1580,14 +1583,6 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
             SharingStarted.Eagerly,
             RawSharpeningDefaults.DEFAULT_STRENGTH,
         )
-    val rawMaxQualityTuningEnabled: StateFlow<Boolean> = userPreferencesRepository.userPreferences
-        .map { it.rawMaxQualityTuningEnabled }
-        .stateIn(
-            viewModelScope,
-            SharingStarted.Eagerly,
-            PhotonSensorSizeTuning.DEFAULT_RAW_MAX_QUALITY_TUNING_ENABLED,
-        )
-
     val rawMaxNoiseReduction: StateFlow<Float> = userPreferencesRepository.userPreferences
         .map { it.rawMaxNoiseReduction }
         .stateIn(
@@ -2789,10 +2784,6 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
         viewModelScope.launch { userPreferencesRepository.saveRawMaxSharpening(value) }
     }
 
-    fun setRawMaxQualityTuningEnabled(enabled: Boolean) {
-        viewModelScope.launch { userPreferencesRepository.saveRawMaxQualityTuningEnabled(enabled) }
-    }
-
     fun setRawMaxNoiseReduction(value: Float) {
         viewModelScope.launch { userPreferencesRepository.saveRawMaxNoiseReduction(value) }
     }
@@ -3237,9 +3228,7 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
                 ?: HncsFilmCurveMode.Standard,
             rawExposureCompensation = userPrefs?.rawExposureCompensation ?: 0f,
             rawAutoExposure = effectiveRawAutoExposure,
-            customProperties = rawProcessingMetadataProperties(
-                userPrefs, cameraController.getCurrentSensorPhysicalAreaMm2(),
-            ),
+            customProperties = rawProcessingMetadataProperties(userPrefs),
             rawHighlightsAdjustment = userPrefs?.rawHighlightsAdjustment ?: 0f,
             rawShadowsAdjustment = userPrefs?.rawShadowsAdjustment ?: 0f,
             rawBlackPointCorrection = userPrefs?.rawBlackPointCorrection ?: 0f,
@@ -6056,6 +6045,7 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
             )
             val denoiseStrengths = resolveCaptureDenoiseStrengths(
                 isRawCapture = isRawCapture,
+                isMergedCapture = false,
                 userPrefs = userPrefs,
             )
             val noiseReductionValue = denoiseStrengths.editableLuma
@@ -6127,9 +6117,7 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
                 rawExposureCompensation = userPrefs?.rawExposureCompensation ?: 0f,
                 rawAutoExposure = effectiveRawAutoExposure,
                 customProperties = RawCaptureExposureCompensationMetadata.write(
-                    rawProcessingMetadataProperties(
-                        userPrefs, cameraController.getCurrentSensorPhysicalAreaMm2(),
-                    ),
+                    rawProcessingMetadataProperties(userPrefs),
                     captureExposureCompensationEv,
                 ),
                 rawHighlightsAdjustment = userPrefs?.rawHighlightsAdjustment ?: 0f,
@@ -6292,9 +6280,7 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
                     ?: HncsFilmCurveMode.Standard,
                 rawExposureCompensation = userPrefs?.rawExposureCompensation ?: 0f,
                 rawAutoExposure = effectiveRawAutoExposure,
-                customProperties = rawProcessingMetadataProperties(
-                    userPrefs, cameraController.getCurrentSensorPhysicalAreaMm2(),
-                ),
+                customProperties = rawProcessingMetadataProperties(userPrefs),
                 rawHighlightsAdjustment = userPrefs?.rawHighlightsAdjustment ?: 0f,
                 rawShadowsAdjustment = userPrefs?.rawShadowsAdjustment ?: 0f,
                 rawBlackPointCorrection = userPrefs?.rawBlackPointCorrection ?: 0f,
@@ -6465,6 +6451,7 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
             )
             val denoiseStrengths = resolveCaptureDenoiseStrengths(
                 isRawCapture = isRawStack,
+                isMergedCapture = true,
                 userPrefs = userPrefs,
             )
             val noiseReductionValue = denoiseStrengths.editableLuma
@@ -6565,9 +6552,7 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
                 rawExposureCompensation = userPrefs?.rawExposureCompensation ?: 0f,
                 rawAutoExposure = effectiveRawAutoExposure,
                 customProperties = RawCaptureExposureCompensationMetadata.write(
-                    rawProcessingMetadataProperties(
-                        userPrefs, cameraController.getCurrentSensorPhysicalAreaMm2(),
-                    ),
+                    rawProcessingMetadataProperties(userPrefs),
                     captureExposureCompensationEv,
                 ),
                 rawHighlightsAdjustment = userPrefs?.rawHighlightsAdjustment ?: 0f,
@@ -6828,6 +6813,7 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
         )
         val denoiseStrengths = resolveCaptureDenoiseStrengths(
             isRawCapture = isRawCapture,
+            isMergedCapture = true,
             userPrefs = userPrefs,
         )
         val noiseReductionValue = denoiseStrengths.editableLuma
@@ -6892,9 +6878,7 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
                 ?: HncsFilmCurveMode.Standard,
             rawExposureCompensation = userPrefs?.rawExposureCompensation ?: 0f,
             rawAutoExposure = effectiveRawAutoExposure,
-            customProperties = rawProcessingMetadataProperties(
-                userPrefs, cameraController.getCurrentSensorPhysicalAreaMm2(),
-            ),
+            customProperties = rawProcessingMetadataProperties(userPrefs),
             rawHighlightsAdjustment = userPrefs?.rawHighlightsAdjustment ?: 0f,
             rawShadowsAdjustment = userPrefs?.rawShadowsAdjustment ?: 0f,
             rawBlackPointCorrection = userPrefs?.rawBlackPointCorrection ?: 0f,
