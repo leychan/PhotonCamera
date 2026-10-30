@@ -59,6 +59,7 @@ import com.hinnka.mycamera.data.UserPreferencesRepository
 import com.hinnka.mycamera.gallery.ExifWriter
 import com.hinnka.mycamera.gallery.GalleryManager
 import com.hinnka.mycamera.gallery.MediaMetadata
+import com.hinnka.mycamera.gallery.usesSystemCaptureStorage
 import com.hinnka.mycamera.livephoto.GoogleLivePhotoCreator
 import com.hinnka.mycamera.livephoto.MotionPhotoWriter
 import com.hinnka.mycamera.livephoto.VivoLivePhotoCreator
@@ -293,7 +294,8 @@ class ApplyLutActivity : AppCompatActivity() {
         val photoIds = GalleryManager.getPhotoIds(this)
         return photoIds.firstOrNull { photoId ->
             val metadata = GalleryManager.loadMetadata(this, photoId) ?: return@firstOrNull false
-            metadata.sourceUri != null && metadata.sourceUri in sourceUriCandidates
+            !metadata.usesSystemCaptureStorage &&
+                metadata.sourceUri != null && metadata.sourceUri in sourceUriCandidates
         }
     }
 

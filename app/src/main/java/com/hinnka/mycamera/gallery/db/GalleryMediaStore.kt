@@ -6,12 +6,16 @@ import android.graphics.Rect
 import android.net.Uri
 import android.os.Environment
 import android.provider.OpenableColumns
+import android.provider.MediaStore
 import androidx.core.net.toUri
 import com.hinnka.mycamera.camera.AspectRatio
 import com.hinnka.mycamera.camera.RawBlackBorderCrop
 import com.hinnka.mycamera.gallery.MediaData
 import com.hinnka.mycamera.gallery.MediaMetadata
 import com.hinnka.mycamera.gallery.MediaType
+import com.hinnka.mycamera.gallery.CaptureStorage
+import com.hinnka.mycamera.gallery.isFinalizedCapture
+import com.hinnka.mycamera.gallery.usesSystemCaptureStorage
 import com.hinnka.mycamera.hdr.HdrGainmapStrength
 import com.hinnka.mycamera.lut.BaselineColorCorrectionTarget
 import com.hinnka.mycamera.raw.HncsFilmCurveMode
@@ -69,8 +73,53 @@ object GalleryMediaStore {
                     prefs.edit().putBoolean(KEY_FILE_INDEXED, true).apply()
                     PLog.d(TAG, "File gallery index complete: ${entities.size} records")
                 }
+                // 新拍元数据的首次写入也必须先通过此锁，清理不会触及本进程正在保存的照片。
+                cleanupInterruptedCaptures(appContext, dao)
                 migrationChecked = true
             }
+        }
+    }
+
+    private suspend fun cleanupInterruptedCaptures(context: Context, dao: GalleryMediaDao) {
+        var offset = 0
+        while (true) {
+            val page = dao.queryPage(offset, 200)
+            if (page.isEmpty()) return
+            var removedCount = 0
+            for (entity in page) {
+                val properties = GalleryDelimitedCodec.decodeMap(entity.customProperties)
+                if (properties[CaptureStorage.MODE_KEY] != CaptureStorage.SYSTEM_FINAL ||
+                    !entity.sourceUri.isNullOrBlank()
+                ) continue
+
+                var exportsDeleted = true
+                for (uriString in GalleryDelimitedCodec.decodeList(entity.exportedUris).distinct()) {
+                    try {
+                        val uri = Uri.parse(uriString)
+                        require(uri.scheme == "content" && uri.authority == MediaStore.AUTHORITY) {
+                            "Interrupted capture contains a non-MediaStore export: $uri"
+                        }
+                        context.contentResolver.delete(uri, null, null)
+                    } catch (error: CancellationException) {
+                        throw error
+                    } catch (error: Exception) {
+                        exportsDeleted = false
+                        PLog.e(TAG, "清理未完成拍摄的系统文件失败，保留草稿以便重试: ${entity.id}", error)
+                    }
+                }
+                if (!exportsDeleted) continue
+
+                val photoDir = getPhotoDir(context, entity.id)
+                if (photoDir.exists() && !photoDir.deleteRecursively()) {
+                    PLog.e(TAG, "清理未完成拍摄的私有素材失败，保留草稿以便重试: ${entity.id}")
+                    continue
+                }
+                dao.deleteById(entity.id)
+                removedCount++
+                PLog.i(TAG, "已清理上次进程遗留的拍摄草稿: ${entity.id}")
+            }
+            offset += page.size - removedCount
+            if (page.size < 200) return
         }
     }
 
@@ -127,22 +176,29 @@ object GalleryMediaStore {
         ensureMigrated(context)
         return withContext(Dispatchers.IO) {
             val dao = GalleryDatabase.getInstance(context.applicationContext).galleryMediaDao()
-            val list = dao.queryPage(offset, limit)
-            val result = list.mapNotNull { entity ->
-                entity.toMediaData(context.applicationContext, entity.toMetadata())
+            val result = mutableListOf<MediaData>()
+            var queryOffset = offset
+            while (result.size < limit) {
+                val requested = minOf(limit - result.size, 200)
+                val list = dao.queryPage(queryOffset, requested)
+                if (list.isEmpty()) break
+                list.forEach { entity ->
+                    val metadata = entity.toMetadata()
+                    val media = entity.toMediaData(context.applicationContext, metadata)
+                    if (media != null) {
+                        result += media
+                    }
+                }
+                // 保留系统成片的映射，外部相册从回收站恢复后仍可关联原拍摄信息。
+                queryOffset += list.size
+                if (list.size < requested) break
             }
             result
         }
     }
 
     suspend fun queryLatestPhoto(context: Context): MediaData? {
-        ensureMigrated(context)
-        return withContext(Dispatchers.IO) {
-            val dao = GalleryDatabase.getInstance(context.applicationContext).galleryMediaDao()
-            dao.queryPage(offset = 0, limit = 1).firstNotNullOfOrNull { entity ->
-                entity.toMediaData(context.applicationContext, entity.toMetadata())
-            }
-        }
+        return queryPhotos(context, offset = 0, limit = 1).firstOrNull()
     }
 
     suspend fun getPhotoData(context: Context, photoId: String): MediaData? {
@@ -181,7 +237,8 @@ object GalleryMediaStore {
         val videoFile = File(photoDir, VIDEO_FILE)
         val dngFile = File(photoDir, DNG_FILE)
         val highQualityPhotoFile = File(photoDir, HIGH_QUALITY_PHOTO_FILE)
-        val displayFile = photoFile.takeIf { it.exists() } ?: highQualityPhotoFile.takeIf { it.exists() }
+        val displayFile = if (metadata.isFinalizedCapture) null else
+            photoFile.takeIf { it.exists() } ?: highQualityPhotoFile.takeIf { it.exists() }
         val originalFile = dngFile.takeIf { it.exists() } ?: highQualityPhotoFile.takeIf { it.exists() } ?: photoFile
         val sourceOnlySize = if (displayFile == null) {
             metadata.sourceUri?.let { runCatching { queryContentSize(context, Uri.parse(it)) }.getOrNull() } ?: 0L
@@ -210,9 +267,9 @@ object GalleryMediaStore {
             hasOriginal = displayFile != null,
             hasThumbnail = thumbnailFile.exists(),
             hasVideo = videoFile.exists(),
-            hasDng = dngFile.exists(),
-            hasYuv = highQualityPhotoFile.exists(),
-            isBurstPhoto = hasBurstPhotos(photoDir),
+            hasDng = !metadata.isFinalizedCapture && dngFile.exists(),
+            hasYuv = !metadata.isFinalizedCapture && highQualityPhotoFile.exists(),
+            isBurstPhoto = !metadata.isFinalizedCapture && hasBurstPhotos(photoDir),
             updatedAt = System.currentTimeMillis(),
             version = metadata.version,
             lutId = metadata.lutId,
@@ -346,6 +403,57 @@ object GalleryMediaStore {
     }
 
     private fun GalleryMediaEntity.toMediaData(context: Context, metadata: MediaMetadata): MediaData? {
+        // 草稿只通过本进程的 processingPhotos 显示，不能把遗留素材当作已保存成片。
+        if (metadata.usesSystemCaptureStorage && !metadata.isFinalizedCapture) return null
+        if (metadata.isFinalizedCapture) {
+            val finalUri = requireNotNull(sourceUri).toUri()
+            var finalName = finalUri.lastPathSegment ?: id
+            var finalSize = size
+            var finalWidth = width
+            var finalHeight = height
+            var finalMimeType = mimeType ?: "image/jpeg"
+            try {
+                context.contentResolver.query(
+                    finalUri,
+                    arrayOf(
+                        MediaStore.MediaColumns.DISPLAY_NAME,
+                        MediaStore.MediaColumns.SIZE,
+                        MediaStore.MediaColumns.WIDTH,
+                        MediaStore.MediaColumns.HEIGHT,
+                        MediaStore.MediaColumns.MIME_TYPE,
+                        MediaStore.MediaColumns.IS_TRASHED
+                    ),
+                    null, null, null
+                )?.use { cursor ->
+                    if (!cursor.moveToFirst()) return null
+                    if (cursor.getInt(5) != 0) return null
+                    finalName = cursor.getString(0) ?: finalName
+                    finalSize = cursor.getLong(1)
+                    finalWidth = cursor.getInt(2).takeIf { it > 0 } ?: finalWidth
+                    finalHeight = cursor.getInt(3).takeIf { it > 0 } ?: finalHeight
+                    finalMimeType = cursor.getString(4) ?: finalMimeType
+                }
+            } catch (_: java.io.FileNotFoundException) {
+                return null
+            } catch (error: Exception) {
+                // 权限或媒体服务暂时不可用不代表原片已被删除。
+                PLog.w(TAG, "Unable to refresh finalized photo: $id", error)
+            }
+            return MediaData(
+                id = id,
+                uri = finalUri,
+                thumbnailUri = finalUri,
+                displayName = finalName,
+                dateAdded = dateAdded,
+                size = finalSize,
+                width = finalWidth,
+                height = finalHeight,
+                mimeType = finalMimeType,
+                sourceUri = finalUri,
+                isMotionPhoto = metadata.customProperties[CaptureStorage.MOTION_KEY] == "true",
+                metadata = metadata.copy(width = finalWidth, height = finalHeight, mimeType = finalMimeType)
+            )
+        }
         val photoDir = getPhotoDir(context, id)
         val photoFile = File(photoDir, PHOTO_FILE)
         val thumbnailFile = File(photoDir, THUMBNAIL_FILE)
@@ -353,7 +461,7 @@ object GalleryMediaStore {
         val dngFile = File(photoDir, DNG_FILE)
         val highQualityPhotoFile = File(photoDir, HIGH_QUALITY_PHOTO_FILE)
         val thumbnailUri = when {
-            thumbnailFile.exists() -> Uri.fromFile(thumbnailFile)
+            thumbnailFile.isFile && thumbnailFile.length() > 0L -> Uri.fromFile(thumbnailFile)
             sourceUri != null -> sourceUri.toUri()
             else -> return null
         }

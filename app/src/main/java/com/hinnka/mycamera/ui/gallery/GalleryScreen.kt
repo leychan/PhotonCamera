@@ -64,6 +64,7 @@ import androidx.recyclerview.widget.StaggeredGridLayoutManager
 import com.hinnka.mycamera.R
 import com.hinnka.mycamera.gallery.MediaData
 import com.hinnka.mycamera.gallery.GalleryManager
+import com.hinnka.mycamera.gallery.isFinalizedCapture
 import com.hinnka.mycamera.gallery.ProcessingPhoto
 import com.hinnka.mycamera.ui.components.ProcessingPhotoShimmerView
 import coil.load
@@ -116,6 +117,7 @@ fun GalleryScreen(
     val isSelectionMode = viewModel.isSelectionMode
     val selectedPhotos = viewModel.selectedPhotos
     val selectedImageCount = selectedPhotos.count { it.isImage }
+    val selectedHasFinalizedCapture = selectedPhotos.any { it.isFinalizedCapture }
     val selectedTab = viewModel.selectedTab
     val hasPermission = viewModel.hasGalleryPermission
     val isBatchOperationRunning = isExporting || isPastingSettings
@@ -141,8 +143,10 @@ fun GalleryScreen(
             if (importedIds.size == 1) {
                 val newPhotoId = importedIds.first()
                 viewModel.setCurrentPhotoById(newPhotoId)
-                viewModel.enterEditMode()
-                onNavigateToEdit(newPhotoId)
+                if (viewModel.getCurrentPhoto()?.isFinalizedCapture != true) {
+                    viewModel.enterEditMode()
+                    onNavigateToEdit(newPhotoId)
+                }
             }
         }
     }
@@ -169,8 +173,8 @@ fun GalleryScreen(
     val batchDeleteLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.StartIntentSenderForResult()
     ) { result ->
-        if (result.resultCode == Activity.RESULT_OK || viewModel.selectedTab == GalleryTab.PHOTON) {
-            // User confirmed deletion or we are in PHOTON tab (delete internal photos anyway)
+        if (result.resultCode == Activity.RESULT_OK) {
+            // 系统删除取消时不清除图库中的成片记录。
             viewModel.deleteBatchPhotosAfterConfirmation()
         } else {
             // User cancelled deletion in SYSTEM tab
@@ -436,14 +440,15 @@ fun GalleryScreen(
                                 )
                             }
 
-                            // 批量粘贴设置
-                            val canPasteSettings = hasCopiedEditSettings &&
-                                selectedImageCount > 0 &&
-                                !isBatchOperationRunning
-                            Column(
-                                horizontalAlignment = Alignment.CenterHorizontally,
-                                modifier = Modifier.clickable(enabled = canPasteSettings) {
-                                    viewModel.pasteCopiedSettingsToSelectedPhotos {
+                            if (!selectedHasFinalizedCapture) {
+                                // 批量粘贴设置
+                                val canPasteSettings = hasCopiedEditSettings &&
+                                    selectedImageCount > 0 &&
+                                    !isBatchOperationRunning
+                                Column(
+                                    horizontalAlignment = Alignment.CenterHorizontally,
+                                    modifier = Modifier.clickable(enabled = canPasteSettings) {
+                                        viewModel.pasteCopiedSettingsToSelectedPhotos {
                                             successCount,
                                             total ->
                                             Toast.makeText(
@@ -455,34 +460,35 @@ fun GalleryScreen(
                                                 ),
                                                 Toast.LENGTH_SHORT
                                             ).show()
-                                    }
+                                        }
+                                    },
+                                ) {
+                                    Icon(
+                                        imageVector = AppIcons.ContentCopy,
+                                        contentDescription =
+                                            stringResource(R.string.paste_settings),
+                                        tint = if (canPasteSettings) {
+                                            AccentColor
+                                        } else {
+                                            Color.White.copy(alpha = 0.38f)
+                                        },
+                                        modifier = Modifier.size(28.dp)
+                                    )
+                                    Spacer(modifier = Modifier.height(4.dp))
+                                    Text(
+                                        text = stringResource(R.string.paste_settings),
+                                        color = if (canPasteSettings) {
+                                            Color.White
+                                        } else {
+                                            Color.White.copy(alpha = 0.38f)
+                                        },
+                                        fontSize = 12.sp
+                                    )
                                 }
-                            ) {
-                                Icon(
-                                    imageVector = AppIcons.ContentCopy,
-                                    contentDescription =
-                                        stringResource(R.string.paste_settings),
-                                    tint = if (canPasteSettings) {
-                                        AccentColor
-                                    } else {
-                                        Color.White.copy(alpha = 0.38f)
-                                    },
-                                    modifier = Modifier.size(28.dp)
-                                )
-                                Spacer(modifier = Modifier.height(4.dp))
-                                Text(
-                                    text = stringResource(R.string.paste_settings),
-                                    color = if (canPasteSettings) {
-                                        Color.White
-                                    } else {
-                                        Color.White.copy(alpha = 0.38f)
-                                    },
-                                    fontSize = 12.sp
-                                )
                             }
 
                             // 批量导出
-                            if (viewModel.selectedTab == GalleryTab.PHOTON) {
+                            if (viewModel.selectedTab == GalleryTab.PHOTON && !selectedHasFinalizedCapture) {
                                 val canExport = selectedImageCount > 0 &&
                                     !isBatchOperationRunning
                                 Column(
@@ -627,6 +633,7 @@ fun GalleryScreen(
     if (showDeleteDialog) {
         val exportedPhotosCount = remember(selectedPhotos) {
             selectedPhotos.sumOf { photo ->
+                if (photo.isFinalizedCapture) return@sumOf 0
                 val baseCount = photo.metadata?.exportedUris?.size ?: 0
                 val sourceUri = photo.metadata?.sourceUri
                 val isVideoAndCaptured = photo.isVideo &&

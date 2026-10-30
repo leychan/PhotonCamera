@@ -384,6 +384,8 @@
     <string name="settings_storage_path_external_tree">Folder...</string>
     <string name="settings_storage_path_external_selected">Folder: %1$s</string>
     <string name="settings_storage_path_permission_failed">Failed to save folder permission</string>
+    <string name="settings_photo_export_directory">Export Folder</string>
+    <string name="settings_photo_export_directory_description">Used for manually exporting existing or imported photos. New captures are saved directly to DCIM/PhotonCamera in the system gallery.</string>
     <string name="settings_auto_save">Auto Save</string>
     <string name="settings_auto_save_description">Automatically save photos after capture</string>
     <string name="settings_save_location">Save Location</string>

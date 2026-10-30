@@ -335,13 +335,11 @@ fun SettingsScreen(
     val topSheetAspectRatios by viewModel.topSheetAspectRatios.collectAsState()
     val customAspectRatios by viewModel.customAspectRatios.collectAsState()
     val availablePhotoAspectRatios by viewModel.availablePhotoAspectRatios.collectAsState()
-    val autoSaveAfterCapture by viewModel.autoSaveAfterCapture.collectAsState(initial = true)
     val nrLevel by viewModel.nrLevel.collectAsState(initial = NoiseReductionLevel.DEFAULT)
     val edgeLevel by viewModel.edgeLevel.collectAsState(initial = 1)
     val vendorCaptureSettingsByLens by viewModel.vendorCaptureSettingsByLens.collectAsState()
     val customVendorKeySettings by viewModel.customVendorKeySettings.collectAsState()
     val useRaw by viewModel.useRaw.collectAsState(initial = false)
-    val exportDngWithRawExport by viewModel.exportDngWithRawExport.collectAsState(initial = false)
     val defaultFocalLength by viewModel.defaultFocalLength.collectAsState(initial = 0f)
     val customLensIds by viewModel.customLensIds.collectAsState(initial = emptyList())
     val lensIdBlacklist by viewModel.lensIdBlacklist.collectAsState(initial = emptyList())
@@ -1513,14 +1511,8 @@ fun SettingsScreen(
                         )
 
                         DropdownSettingItem(
-                            title = stringResource(
-                                R.string.settings_storage_path_title,
-                                stringResource(R.string.settings_storage_path_photo_title_arg)
-                            ),
-                            description = stringResource(
-                                R.string.settings_storage_path_description,
-                                stringResource(R.string.settings_storage_path_photo_description_arg)
-                            ),
+                            title = stringResource(R.string.settings_photo_export_directory),
+                            description = stringResource(R.string.settings_photo_export_directory_description),
                             value = photoSavePathValue,
                             options = photoSavePathLabels,
                             isLoading = false,
@@ -1537,18 +1529,6 @@ fun SettingsScreen(
                                     null -> Unit
                                 }
                             }
-                        )
-
-                        HorizontalDivider(
-                            color = Color.White.copy(alpha = 0.1f),
-                            modifier = Modifier.padding(vertical = 8.dp)
-                        )
-
-                        SwitchSettingItem(
-                            title = stringResource(R.string.settings_auto_save),
-                            description = stringResource(R.string.settings_auto_save_description),
-                            checked = autoSaveAfterCapture,
-                            onCheckedChange = { viewModel.setAutoSaveAfterCapture(it) }
                         )
 
                         HorizontalDivider(
@@ -2386,10 +2366,10 @@ fun SettingsScreen(
                         )
                     }
 
-                    SettingsSection(
-                        title = stringResource(R.string.settings_raw_group_capture_output)
-                    ) {
-                        if (isHdrSettingsSupported) {
+                    if (isHdrSettingsSupported) {
+                        SettingsSection(
+                            title = stringResource(R.string.settings_raw_group_capture_output)
+                        ) {
                             SwitchSettingItem(
                                 title = stringResource(R.string.settings_ultra_hdr_gain_map),
                                 description = stringResource(
@@ -2398,26 +2378,9 @@ fun SettingsScreen(
                                 checked = ultraHdrGainMapEnabled,
                                 onCheckedChange = viewModel::setUltraHdrGainMapEnabled,
                             )
-
-                            HorizontalDivider(
-                                modifier = Modifier.padding(vertical = 8.dp),
-                                color = Color.White.copy(alpha = 0.1f)
-                            )
                         }
-
-                        QualityLevelSetting(
-                            title = stringResource(R.string.settings_export_dng_with_raw_export),
-                            description = stringResource(R.string.settings_export_dng_with_raw_export_description),
-                            levels = listOf(
-                                false to stringResource(R.string.settings_professional_export_jpg),
-                                true to stringResource(R.string.settings_professional_export_raw_jpg),
-                            ),
-                            currentLevel = exportDngWithRawExport,
-                            onLevelSelected = viewModel::setExportDngWithRawExport,
-                        )
+                        Spacer(modifier = Modifier.height(24.dp))
                     }
-
-                    Spacer(modifier = Modifier.height(24.dp))
 
                     SettingsSection(
                         title = stringResource(R.string.settings_raw_group_sensor_correction)

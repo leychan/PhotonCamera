@@ -57,6 +57,7 @@ import com.hinnka.mycamera.R
 import androidx.compose.ui.res.painterResource
 import com.hinnka.mycamera.gallery.MediaData
 import com.hinnka.mycamera.gallery.GalleryManager
+import com.hinnka.mycamera.gallery.isFinalizedCapture
 import com.hinnka.mycamera.ui.theme.AccentColor
 import com.hinnka.mycamera.ui.theme.OnAccentColor
 import com.hinnka.mycamera.viewmodel.GalleryViewModel
@@ -207,8 +208,8 @@ fun GalleryDetailScreen(
     val deletePhotoLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.StartIntentSenderForResult()
     ) { result ->
-        if (result.resultCode == Activity.RESULT_OK || viewModel.selectedTab == GalleryTab.PHOTON) {
-            // User confirmed deletion or we are in PHOTON tab (delete internal photo anyway)
+        if (result.resultCode == Activity.RESULT_OK) {
+            // 系统删除取消时保留成片及其图库记录。
             viewModel.deletePhotoAfterConfirmation { success ->
                 if (success && viewModel.currentPhotos.value.isEmpty()) {
                     onBack()
@@ -326,6 +327,7 @@ fun GalleryDetailScreen(
     }
 
     val currentPhoto = photos.getOrNull(pagerState.currentPage)
+    val isCurrentFinalizedCapture = currentPhoto?.isFinalizedCapture == true
     val isCurrentPhotoProcessing = currentPhoto?.id?.let(processingPhotos::containsKey) == true
 
     LaunchedEffect(currentPhoto?.id, isCurrentPhotoProcessing) {
@@ -365,7 +367,7 @@ fun GalleryDetailScreen(
     LaunchedEffect(currentPhoto?.id) {
         showHdrStrengthPanel = false
     }
-    val isCurrentRawPhoto = !isCurrentPhotoProcessing && currentPhoto?.let {
+    val isCurrentRawPhoto = !isCurrentPhotoProcessing && !isCurrentFinalizedCapture && currentPhoto?.let {
         it.isImage && (viewModel.selectedTab == GalleryTab.PHOTON || it.relatedPhoto != null) && viewModel.isRaw(it.id)
     } == true
     var displayPhotoSize by remember(currentPhoto?.id) { mutableLongStateOf(currentPhoto?.size ?: 0L) }
@@ -466,7 +468,7 @@ fun GalleryDetailScreen(
                             }
                         }
                     }
-                    if (!isCurrentPhotoProcessing && currentPhoto != null && currentPhoto.isImage && viewModel.isRaw(currentPhoto.id)) {
+                    if (!isCurrentPhotoProcessing && !isCurrentFinalizedCapture && currentPhoto != null && currentPhoto.isImage && viewModel.isRaw(currentPhoto.id)) {
                         val isRefreshing = viewModel.refreshingPhotos.contains(currentPhoto.id)
                         val infiniteTransition = rememberInfiniteTransition(label = "refresh")
                         val rotation by infiniteTransition.animateFloat(
@@ -504,7 +506,7 @@ fun GalleryDetailScreen(
                             )
                         }
                     }
-                    if (!isCurrentPhotoProcessing && currentPhoto != null && currentPhoto.isImage && currentPhoto.isBurstPhoto) {
+                    if (!isCurrentPhotoProcessing && !isCurrentFinalizedCapture && currentPhoto != null && currentPhoto.isImage && currentPhoto.isBurstPhoto) {
                         IconButton(onClick = { onViewBurst?.invoke(currentPhoto.id) }, modifier = Modifier.autoRotate()) {
                             Icon(
                                 imageVector = AppIcons.BurstMode,
@@ -515,6 +517,7 @@ fun GalleryDetailScreen(
                     }
                     if (
                         !isCurrentPhotoProcessing &&
+                        !isCurrentFinalizedCapture &&
                         currentPhoto != null &&
                         currentPhoto.isImage &&
                         Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE &&
@@ -570,7 +573,7 @@ fun GalleryDetailScreen(
                         )
                     }
 
-                    if (currentPhoto?.isImage == true || currentPhoto?.isVideo == true) {
+                    if (!isCurrentFinalizedCapture && (currentPhoto?.isImage == true || currentPhoto?.isVideo == true)) {
                         GalleryGroupedActionButton(
                             icon = Icons.Default.Edit,
                             contentDescription = stringResource(R.string.edit),
@@ -600,12 +603,14 @@ fun GalleryDetailScreen(
                     )
                 },
                 trailingAction = {
-                    GalleryCircleActionButton(
-                        icon = AppIcons.MoreHoriz,
-                        contentDescription = stringResource(R.string.more_options),
-                        enabled = currentPhoto != null && !isCurrentPhotoProcessing,
-                        onClick = { showMoreSheet = true }
-                    )
+                    if (!isCurrentFinalizedCapture) {
+                        GalleryCircleActionButton(
+                            icon = AppIcons.MoreHoriz,
+                            contentDescription = stringResource(R.string.more_options),
+                            enabled = currentPhoto != null && !isCurrentPhotoProcessing,
+                            onClick = { showMoreSheet = true }
+                        )
+                    }
                 }
             )
         },
@@ -683,7 +688,7 @@ fun GalleryDetailScreen(
                                                     if (!isMultiTouch && !isMoved && upEvent == null) {
                                                         if (photo.isMotionPhoto) {
                                                             isPlaying = true
-                                                        } else {
+                                                        } else if (!photo.isFinalizedCapture) {
                                                             showOrigin = true
                                                         }
                                                         while (true) {
@@ -744,6 +749,7 @@ fun GalleryDetailScreen(
             }
             if (
                 !isCurrentPhotoProcessing &&
+                !isCurrentFinalizedCapture &&
                 showHdrStrengthPanel &&
                 currentPhoto != null &&
                 currentPhoto.isImage &&
@@ -782,7 +788,7 @@ fun GalleryDetailScreen(
     // 删除确认对话框
     if (showDeleteDialog && !isCurrentPhotoProcessing) {
         val exportedPhotosCount = remember(currentPhoto, currentPhoto?.metadata, currentPhoto?.metadata?.exportedUris) {
-            val baseCount = currentPhoto?.metadata?.exportedUris?.size ?: 0
+            val baseCount = if (isCurrentFinalizedCapture) 0 else currentPhoto?.metadata?.exportedUris?.size ?: 0
             val sourceUri = currentPhoto?.metadata?.sourceUri
             val isVideoAndCaptured = currentPhoto?.isVideo == true &&
                     currentPhoto.metadata?.isImported != true &&
@@ -835,7 +841,7 @@ fun GalleryDetailScreen(
                 TextButton(
                     onClick = {
                         currentPhoto?.let { photo ->
-                            val finalDeleteExported = if (viewModel.selectedTab == GalleryTab.PHOTON && exportedPhotosCount > 0) deleteExportedState else true
+                            val finalDeleteExported = if (!isCurrentFinalizedCapture && viewModel.selectedTab == GalleryTab.PHOTON && exportedPhotosCount > 0) deleteExportedState else true
                             if (viewModel.selectedTab == GalleryTab.PHOTON && exportedPhotosCount > 0) {
                                 viewModel.setDeleteExported(deleteExportedState)
                             }
@@ -859,7 +865,7 @@ fun GalleryDetailScreen(
     }
 
     // 导出确认对话框
-    if (showExportDialog && !isCurrentPhotoProcessing) {
+    if (showExportDialog && !isCurrentPhotoProcessing && !isCurrentFinalizedCapture) {
         AlertDialog(
             onDismissRequest = { showExportDialog = false },
             title = { Text(stringResource(R.string.export)) },
@@ -1093,7 +1099,7 @@ fun GalleryDetailScreen(
     }
 
     // 更多 BottomSheet
-    if (showMoreSheet && currentPhoto != null && !isCurrentPhotoProcessing) {
+    if (showMoreSheet && currentPhoto != null && !isCurrentPhotoProcessing && !isCurrentFinalizedCapture) {
         val moreSheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
         val moreActions = buildList {
             if (currentPhoto.isImage && (viewModel.selectedTab == GalleryTab.PHOTON || currentPhoto.relatedPhoto != null)) {
@@ -2487,16 +2493,11 @@ fun MotionPhotoPlayer(
 ) {
     val context = LocalContext.current
     val lifecycle = LocalLifecycleOwner.current.lifecycle
-    val videoFile = remember(photo.id) {
-        viewModel.getMotionPhotoVideo(photo)
+    if (!photo.isMotionPhoto) return
+    val videoFile by produceState<File?>(null, photo.id, photo.uri, photo.sourceUri) {
+        value = withContext(Dispatchers.IO) { viewModel.getMotionPhotoVideo(photo) }
     }
-
-    if (!photo.isMotionPhoto || videoFile == null || !videoFile.exists()) {
-        if (photo.isMotionPhoto) {
-            PLog.w("MotionPhotoPlayer", "Motion Photo video file missing: ${photo.id}")
-        }
-        return
-    }
+    val playbackFile = videoFile?.takeIf { it.exists() } ?: return
 
     val contentRepository = remember {
         com.hinnka.mycamera.data.ContentRepository.getInstance(context)
@@ -2512,7 +2513,7 @@ fun MotionPhotoPlayer(
         withContext(Dispatchers.IO) {
             PLog.d("MotionPhotoPlayer", "Loading video metadata from DB.")
             val metadata = com.hinnka.mycamera.gallery.GalleryManager.loadMetadata(context, photo.id) ?: photo.metadata
-            val applyEffects = metadata?.applyEffectsToVideo == true
+            val applyEffects = !photo.isFinalizedCapture && metadata?.applyEffectsToVideo == true
             val lutId = if (applyEffects) metadata.lutId else null
             val params = if (applyEffects) metadata.colorRecipeParams else null
             PLog.d("MotionPhotoPlayer", "Metadata loaded. applyEffects: $applyEffects, lutId: $lutId, recipeEnabled: ${params != null}")
@@ -2550,11 +2551,11 @@ fun MotionPhotoPlayer(
 
     var isReadyToShow by remember(photo.id) { mutableStateOf(false) }
 
-    val exoPlayer = remember(photo.id, videoFile.absolutePath, shouldApplyVideoEffects) {
+    val exoPlayer = remember(photo.id, playbackFile.absolutePath, shouldApplyVideoEffects) {
         ExoPlayer.Builder(context).build().apply {
             PLog.d(
                 "MotionPhotoPlayer",
-                "Creating ExoPlayer for ${photo.id}, video=${videoFile.absolutePath}, size=${videoFile.length()}, effects=$shouldApplyVideoEffects"
+                "Creating ExoPlayer for ${photo.id}, video=${playbackFile.absolutePath}, size=${playbackFile.length()}, effects=$shouldApplyVideoEffects"
             )
             repeatMode = Player.REPEAT_MODE_ONE
             if (shouldApplyVideoEffects) {
@@ -2587,7 +2588,7 @@ fun MotionPhotoPlayer(
             if (!lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED)) return@LaunchedEffect
             if (exoPlayer.mediaItemCount == 0) {
                 PLog.d("MotionPhotoPlayer", "Preparing Motion Photo player after PlayerView attach: ${photo.id}")
-                exoPlayer.setMediaItem(MediaItem.fromUri(Uri.fromFile(videoFile)))
+                exoPlayer.setMediaItem(MediaItem.fromUri(Uri.fromFile(playbackFile)))
                 exoPlayer.prepare()
             }
             exoPlayer.seekTo(0)

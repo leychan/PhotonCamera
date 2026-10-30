@@ -7,6 +7,15 @@ enum class MediaType {
     VIDEO
 }
 
+/** 系统相册页通过关联条目共享成片状态，避免再次应用拍摄效果。 */
+val MediaData.usesSystemCaptureStorage: Boolean
+    get() = metadata?.usesSystemCaptureStorage == true ||
+        relatedPhoto?.metadata?.usesSystemCaptureStorage == true
+
+val MediaData.isFinalizedCapture: Boolean
+    get() = metadata?.isFinalizedCapture == true ||
+        relatedPhoto?.metadata?.isFinalizedCapture == true
+
 /**
  * 照片数据模型
  */

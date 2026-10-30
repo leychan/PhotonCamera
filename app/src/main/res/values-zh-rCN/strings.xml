@@ -371,6 +371,8 @@
     <string name="settings_storage_path_external_tree">文件夹...</string>
     <string name="settings_storage_path_external_selected">文件夹：%1$s</string>
     <string name="settings_storage_path_permission_failed">无法保存文件夹权限</string>
+    <string name="settings_photo_export_directory">导出目录</string>
+    <string name="settings_photo_export_directory_description">仅用于旧照片或导入照片的手动导出。新拍照片直接保存到系统相册的 DCIM/PhotonCamera。</string>
     <string name="settings_auto_save">拍摄后自动保存</string>
     <string name="settings_auto_save_description">拍摄后自动保存照片，否则需要手动确认</string>
     <string name="settings_save_location">保存地理位置</string>

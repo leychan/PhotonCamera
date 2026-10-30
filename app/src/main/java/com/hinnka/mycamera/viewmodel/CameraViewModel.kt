@@ -40,6 +40,8 @@ import com.hinnka.mycamera.frame.FramePreviewSelection
 import com.hinnka.mycamera.gallery.GalleryManager
 import com.hinnka.mycamera.gallery.MediaMetadata
 import com.hinnka.mycamera.gallery.PhotoSavePath
+import com.hinnka.mycamera.gallery.isFinalizedCapture
+import com.hinnka.mycamera.gallery.usesSystemCaptureStorage
 import com.hinnka.mycamera.lut.BaselineColorCorrectionTarget
 import com.hinnka.mycamera.lut.BakedLutExporter
 import com.hinnka.mycamera.lut.LutConfig
@@ -3399,7 +3401,7 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
         }
     }
 
-    private suspend fun finishMultipleExposureSessionNow(onSaved: (String) -> Unit) {
+    private suspend fun finishMultipleExposureSessionNow(onSaved: suspend (String) -> Unit) {
         val sessionId = multipleExposureState.sessionId ?: return
         val baseMetadata = multipleExposureMetadata ?: return
         withContext(Dispatchers.IO) {
@@ -3446,6 +3448,10 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
                     photoQualityValue
                 )
                 composedBitmap.recycle()
+                if (GalleryManager.loadMetadata(context, photoId)?.isFinalizedCapture != true) {
+                    multipleExposureState = multipleExposureState.copy(isProcessing = false)
+                    return@withContext
+                }
                 cancelMultipleExposureSession()
                 onSaved(photoId)
                 _imageSavedEvent.emit(photoId)
@@ -3653,9 +3659,15 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
         }
     }
 
-    private fun markCapturedThumbnailSaved(settings: CaptureSettingsSnapshot, photoId: String) {
+    private suspend fun markCapturedThumbnailSaved(settings: CaptureSettingsSnapshot, photoId: String): Boolean {
+        val metadata = GalleryManager.loadMetadata(getApplication(), photoId)
+        if (metadata == null || (metadata.usesSystemCaptureStorage && !metadata.isFinalizedCapture)) {
+            PLog.e(TAG, "拍摄成片尚未成功保存: $photoId")
+            return false
+        }
         settings.savedPhotoId = photoId
         publishCapturedThumbnail(settings)
+        return true
     }
 
     fun acknowledgeCapturedThumbnail(captureId: Long) {
@@ -6214,8 +6226,9 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
                 )
             }
             PLog.d(TAG, "Image saved: $photoId, LUT: $lutIdToSave, Frame: $frameIdToSave")
-            markCapturedThumbnailSaved(settings, photoId)
-            _imageSavedEvent.emit(photoId)
+            if (markCapturedThumbnailSaved(settings, photoId)) {
+                _imageSavedEvent.emit(photoId)
+            }
         } catch (e: Exception) {
             PLog.e(TAG, "Failed to save image", e)
         } finally {
@@ -6355,8 +6368,10 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
                     photoQualityValue
                 )
             }
-            PLog.d(TAG, "Preview bitmap capture saved: $photoId, mode=$metadataCaptureMode")
-            _imageSavedEvent.emit(photoId)
+            if (GalleryManager.loadMetadata(context, photoId)?.isFinalizedCapture == true) {
+                PLog.d(TAG, "Preview bitmap capture saved: $photoId, mode=$metadataCaptureMode")
+                _imageSavedEvent.emit(photoId)
+            }
         } catch (e: Exception) {
             PLog.e(TAG, "Failed to save preview bitmap capture: $metadataCaptureMode", e)
         }
@@ -6654,8 +6669,9 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
                 )
             }
             PLog.d(TAG, "Image saved: $photoId, LUT: $lutIdToSave, Frame: $frameIdToSave")
-            markCapturedThumbnailSaved(settings, photoId)
-            _imageSavedEvent.emit(photoId)
+            if (markCapturedThumbnailSaved(settings, photoId)) {
+                _imageSavedEvent.emit(photoId)
+            }
         } catch (e: Exception) {
             PLog.e(TAG, "Failed to save image", e)
         }
@@ -6748,8 +6764,9 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
                 }
             }
             PLog.d(TAG, "Image saved: $photoId, HDR mode: $captureMode")
-            markCapturedThumbnailSaved(settings, photoId)
-            _imageSavedEvent.emit(photoId)
+            if (markCapturedThumbnailSaved(settings, photoId)) {
+                _imageSavedEvent.emit(photoId)
+            }
         } catch (e: Exception) {
             PLog.e(TAG, "Failed to process HDR bracket", e)
         } finally {

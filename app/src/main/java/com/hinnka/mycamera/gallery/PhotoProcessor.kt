@@ -509,6 +509,11 @@ class PhotoProcessor(
         chromaNoiseReduction: Float = 0f,
         onRawMetadata: ((RawMetadata) -> Unit)? = null
     ): Bitmap? {
+        if (metadata.isFinalizedCapture) {
+            return withContext(Dispatchers.IO) {
+                GalleryManager.loadBitmap(context, android.net.Uri.parse(metadata.sourceUri), preserveHdr = true)
+            }
+        }
         val dngFile = GalleryManager.getDngFile(context, photoId)
 
         if (metadata.hasAiDenoisedBase) {

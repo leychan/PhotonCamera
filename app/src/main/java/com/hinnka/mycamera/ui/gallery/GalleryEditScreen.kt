@@ -65,6 +65,7 @@ import me.saket.telephoto.zoomable.rememberZoomableImageState
 import me.saket.telephoto.zoomable.rememberZoomableState
 import com.hinnka.mycamera.gallery.MediaData
 import com.hinnka.mycamera.gallery.GalleryManager
+import com.hinnka.mycamera.gallery.isFinalizedCapture
 import com.hinnka.mycamera.gallery.PostEditGeometry
 import com.hinnka.mycamera.model.ColorRecipeParams
 import com.hinnka.mycamera.model.RecipeParam
@@ -224,6 +225,13 @@ fun GalleryEditScreen(
     val currentPhotos by viewModel.currentPhotos.collectAsState()
     val currentPhoto = currentPhotos.getOrNull(viewModel.currentPhotoIndex)
     val editSourcePhoto = currentPhoto?.relatedPhoto ?: currentPhoto
+    if (editSourcePhoto?.isFinalizedCapture == true) {
+        LaunchedEffect(editSourcePhoto.id) {
+            viewModel.exitEditMode()
+            onBack()
+        }
+        return
+    }
     val editLutId by viewModel.editLutId.collectAsState()
     val editLutRecipeParams by viewModel.editLutRecipeParams.collectAsState()
     val editPhotoRecipeParams by viewModel.editPhotoRecipeParams.collectAsState()
