@@ -42,6 +42,18 @@ jobs:
         with:
           cache-disabled: ${{ github.event_name == 'workflow_dispatch' && inputs.cold_build }}
 
+      - name: Set up Go for signing tools
+        uses: actions/setup-go@v6
+        with:
+          go-version: '1.27.x'
+          cache: false
+
+      - name: Install signing tools
+        run: |
+          export GOBIN="$RUNNER_TEMP/signing-tools"
+          go install filippo.io/age/cmd/age@v1.3.2 filippo.io/age/cmd/age-plugin-batchpass@v1.3.2
+          echo "$GOBIN" >> "$GITHUB_PATH"
+
       - name: Grant execute permission for gradlew
         run: chmod +x gradlew
 
@@ -55,19 +67,15 @@ jobs:
             printf 'BUILT_IN_API_KEY_GOOGLE=%s\n' "$BUILT_IN_API_KEY_GOOGLE"
           } > local.properties
 
-      - name: Decode Keystore
+      - name: Unlock release signing bundle
         env:
-          RELEASE_KEYSTORE: ${{ secrets.RELEASE_KEYSTORE }}
-        run: printf '%s' "$RELEASE_KEYSTORE" | base64 --decode > app/release.keystore
+          RELEASE_SIGNING_PASSPHRASE: ${{ secrets.RELEASE_SIGNING_PASSPHRASE }}
+        run: sh scripts/signing.sh setup
 
       - name: Build release APK
         env:
           BUILD_VARIANT: ${{ matrix.variant }}
           COLD_BUILD: ${{ github.event_name == 'workflow_dispatch' && inputs.cold_build }}
-          ORG_GRADLE_PROJECT_RELEASE_STORE_FILE: release.keystore
-          ORG_GRADLE_PROJECT_RELEASE_STORE_PASSWORD: ${{ secrets.RELEASE_STORE_PASSWORD }}
-          ORG_GRADLE_PROJECT_RELEASE_KEY_ALIAS: ${{ secrets.RELEASE_KEY_ALIAS }}
-          ORG_GRADLE_PROJECT_RELEASE_KEY_PASSWORD: ${{ secrets.RELEASE_KEY_PASSWORD }}
         run: |
           build_cache_option=--build-cache
           if [[ "$COLD_BUILD" == true ]]; then
@@ -89,6 +97,10 @@ jobs:
             build/reports/kotlin-build/
             app/build/reports/kotlin-build/
           retention-days: 7
+
+      - name: Remove unlocked signing material
+        if: always()
+        run: rm -rf .signing
 
       - name: Save release APK
         uses: actions/upload-artifact@v4
