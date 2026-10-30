@@ -12,6 +12,8 @@ import java.nio.file.attribute.PosixFilePermissions;
 import java.security.KeyStore;
 import java.security.MessageDigest;
 import java.security.PrivateKey;
+import java.security.SecureRandom;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Base64;
 import java.util.HexFormat;
@@ -130,6 +132,12 @@ class SigningBundle {
             if (keyPassword != null) Arrays.fill(keyPassword, '\0');
         }
         byte[] bytes = readFile(keystore);
+        encrypt(bytes, properties, force, null);
+    }
+
+    private void encrypt(byte[] bytes, Properties properties, boolean force, String passphrase) throws Exception {
+        Path bundle = root.resolve("config/signing.age");
+        require(force || !Files.exists(bundle), "bundleExists");
         var store = validate(bytes, properties);
         fingerprint(store, properties);
         properties.setProperty("version", "1");
@@ -138,7 +146,7 @@ class SigningBundle {
         require(plaintext.length <= MAX_SIZE, "tooLarge");
         Path encrypted = temporaryFile(".age");
         try {
-            var process = new ProcessBuilder("age", "--passphrase")
+            var process = ageProcess(true, passphrase)
                     .redirectError(ProcessBuilder.Redirect.INHERIT).redirectOutput(encrypted.toFile()).start();
             try {
                 try (var input = process.getOutputStream()) {
@@ -158,10 +166,83 @@ class SigningBundle {
         }
     }
 
-    private void setup() throws Exception {
+    private ProcessBuilder ageProcess(boolean encrypt, String passphrase) {
+        var command = new ArrayList<String>();
+        command.add("age");
+        command.add(encrypt ? "--encrypt" : "--decrypt");
+        if (passphrase != null) {
+            require(!passphrase.isEmpty(), "passphraseMissing");
+            require(Arrays.stream(System.getenv("PATH").split(java.io.File.pathSeparator))
+                    .anyMatch(path -> Files.isExecutable(Path.of(path, "age-plugin-batchpass"))), "pluginMissing");
+            command.add("-j");
+            command.add("batchpass");
+        } else if (encrypt) {
+            command.add("--passphrase");
+        }
+        if (!encrypt) command.add(root.resolve("config/signing.age").toString());
+        var builder = new ProcessBuilder(command);
+        // 仅把解密口令传给官方插件，避免进入命令参数和构建进程。
+        builder.environment().remove("RELEASE_SIGNING_PASSPHRASE");
+        builder.environment().remove("AGE_PASSPHRASE");
+        builder.environment().remove("AGE_PASSPHRASE_FD");
+        if (passphrase != null) builder.environment().put("AGE_PASSPHRASE", passphrase);
+        return builder;
+    }
+
+    private String randomPassword() {
+        byte[] random = new byte[32];
+        new SecureRandom().nextBytes(random);
+        return Base64.getUrlEncoder().withoutPadding().encodeToString(random);
+    }
+
+    private void initialize(String alias) throws Exception {
+        Path bundle = root.resolve("config/signing.age");
+        Path masterFile = local.resolve("master-passphrase");
+        require(!Files.exists(bundle) && !Files.exists(masterFile)
+                && !Files.exists(local.resolve("release.properties")), "alreadyInitialized");
+        String passphrase = randomPassword();
+        // 先检查插件，依赖缺失时不创建任何正式密钥材料。
+        ageProcess(true, passphrase);
+        String password = randomPassword();
+        var properties = new Properties();
+        properties.setProperty(STORE_PASSWORD, password);
+        properties.setProperty(KEY_PASSWORD, password);
+        properties.setProperty(KEY_ALIAS, alias);
+        Path keystore = temporaryFile(".p12");
+        Files.delete(keystore);
+        try {
+            var builder = new ProcessBuilder(
+                    Path.of(System.getProperty("java.home"), "bin", "keytool").toString(),
+                    "-genkeypair", "-keystore", keystore.toString(), "-storetype", "PKCS12",
+                    "-alias", alias, "-keyalg", "RSA", "-keysize", "4096", "-sigalg", "SHA256withRSA",
+                    "-validity", "36500", "-dname", "CN=PhotonCamera Release,O=PhotonCamera",
+                    "-storepass:env", "PHOTON_KEYSTORE_PASSWORD", "-keypass:env", "PHOTON_KEYSTORE_PASSWORD",
+                    "-noprompt").redirectError(ProcessBuilder.Redirect.INHERIT)
+                    .redirectOutput(ProcessBuilder.Redirect.INHERIT);
+            builder.environment().put("PHOTON_KEYSTORE_PASSWORD", password);
+            var process = builder.start();
+            try {
+                process.getOutputStream().close();
+                require(process.waitFor() == 0, "keyGenerationFailed");
+            } finally {
+                process.destroy();
+            }
+            Files.writeString(Files.createFile(masterFile,
+                    PosixFilePermissions.asFileAttribute(PosixFilePermissions.fromString("rw-------"))),
+                    passphrase + "\n");
+            encrypt(readFile(keystore), properties, false, passphrase);
+            setup(passphrase);
+            System.out.println(message("initialized", masterFile));
+        } finally {
+            Files.deleteIfExists(keystore);
+            if (!Files.exists(bundle)) Files.deleteIfExists(masterFile);
+        }
+    }
+
+    private void setup(String passphrase) throws Exception {
         Path bundle = root.resolve("config/signing.age");
         require(Files.isRegularFile(bundle), "bundleMissing");
-        var process = new ProcessBuilder("age", "--decrypt", bundle.toString())
+        var process = ageProcess(false, passphrase)
                 .redirectError(ProcessBuilder.Redirect.INHERIT).start();
         byte[] plaintext;
         try {
@@ -180,6 +261,13 @@ class SigningBundle {
         require("1".equals(properties.getProperty("version")) && properties.containsKey("keystore"), "invalidBundle");
         byte[] bytes = Base64.getDecoder().decode(properties.getProperty("keystore"));
         var store = validate(bytes, properties);
+        if ("true".equals(System.getenv("GITHUB_ACTIONS"))) {
+            for (String name : new String[]{STORE_PASSWORD, KEY_PASSWORD}) {
+                String secret = properties.getProperty(name).replace("%", "%25")
+                        .replace("\r", "%0D").replace("\n", "%0A");
+                System.out.println("::add-mask::" + secret);
+            }
+        }
         fingerprint(store, properties);
         var config = new Properties();
         for (String name : new String[]{STORE_PASSWORD, KEY_PASSWORD, KEY_ALIAS}) {
@@ -223,24 +311,45 @@ class SigningBundle {
             return;
         }
         boolean pack = args[0].equals("pack");
-        require(pack || args[0].equals("setup"), "invalidArguments");
+        boolean initialize = args[0].equals("init");
+        require(pack || initialize || args[0].equals("setup"), "invalidArguments");
         Path keystore = null;
-        String alias = null;
+        Path passphraseFile = null;
+        String alias = initialize ? "photon-release" : null;
         boolean force = false;
         for (int i = 1; i < args.length; i++) {
-            require(pack, "invalidArguments");
             if (args[i].equals("--force")) {
+                require(pack, "invalidArguments");
                 force = true;
             } else {
                 require(i + 1 < args.length, "invalidArguments");
                 switch (args[i++]) {
-                    case "--keystore" -> keystore = Path.of(args[i]).toAbsolutePath();
-                    case "--alias" -> alias = args[i];
+                    case "--keystore" -> {
+                        require(pack, "invalidArguments");
+                        keystore = Path.of(args[i]).toAbsolutePath();
+                    }
+                    case "--alias" -> {
+                        require(pack || initialize, "invalidArguments");
+                        alias = args[i];
+                    }
+                    case "--passphrase-file" -> {
+                        require(!pack && !initialize, "invalidArguments");
+                        passphraseFile = Path.of(args[i]);
+                    }
                     default -> throw new IllegalArgumentException(message("invalidArguments"));
                 }
             }
         }
         require(!pack || (keystore != null && alias != null), "invalidArguments");
+        require(alias == null || !alias.isBlank(), "invalidArguments");
+        String passphrase = System.getenv("RELEASE_SIGNING_PASSPHRASE");
+        require(passphraseFile == null || passphrase == null, "conflictingPassphrases");
+        if (passphraseFile != null) {
+            passphrase = new String(readFile(passphraseFile), java.nio.charset.StandardCharsets.UTF_8)
+                    .replaceFirst("[\\r\\n]+$", "");
+        }
+        require(passphrase == null || !passphrase.isEmpty(), "passphraseMissing");
+        require(pack || initialize || !"true".equals(System.getenv("CI")) || passphrase != null, "passphraseMissing");
         try {
             var age = new ProcessBuilder("age", "--version")
                     .redirectOutput(ProcessBuilder.Redirect.DISCARD)
@@ -257,8 +366,9 @@ class SigningBundle {
                 StandardOpenOption.CREATE, StandardOpenOption.WRITE);
              var lock = channel.tryLock()) {
             require(lock != null, "busy");
-            if (pack) pack(keystore, alias, force);
-            else setup();
+            if (initialize) initialize(alias);
+            else if (pack) pack(keystore, alias, force);
+            else setup(passphrase);
         }
     }
 
