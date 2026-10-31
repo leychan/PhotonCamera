@@ -1354,6 +1354,7 @@ object GalleryManager {
         mimeType: String,
         sourceFile: File,
         dateTaken: Long?,
+        publishImmediately: Boolean = true,
     ): Uri? {
         if (!sourceFile.exists() || sourceFile.length() <= 0L) {
             PLog.e(TAG, "Cannot export missing or empty file: ${sourceFile.absolutePath}")
@@ -1380,11 +1381,11 @@ object GalleryManager {
             discardPhotoExportUri(context, uri)
             return null
         }
-        if (!publishPhotoExportUri(context, destination, uri)) {
+        if (publishImmediately && !publishPhotoExportUri(context, destination, uri)) {
             discardPhotoExportUri(context, uri)
             return null
         }
-        PLog.d(TAG, "Published photo export: uri=$uri, mimeType=$mimeType, bytes=${sourceFile.length()}")
+        PLog.d(TAG, "Photo export written: uri=$uri, mimeType=$mimeType, bytes=${sourceFile.length()}, published=$publishImmediately")
         return uri
     }
 
@@ -1712,6 +1713,7 @@ object GalleryManager {
                             tempExportFile
                         }
 
+                        val isVivoPair = success && Build.MANUFACTURER.lowercase().contains("vivo")
                         val exportedPhotoUri = exportFileToConfiguredPhotoStorage(
                             context = context,
                             destination = exportDestination,
@@ -1720,43 +1722,42 @@ object GalleryManager {
                             mimeType = "image/jpeg",
                             sourceFile = photoExportFile,
                             dateTaken = date,
+                            publishImmediately = !isVivoPair,
                         )
 
-                        if (exportedPhotoUri != null && Build.MANUFACTURER.lowercase().contains("vivo")) {
+                        if (exportedPhotoUri != null && isVivoPair) {
                             val videoFilename = filename.replace(".jpg", ".mp4")
                             val tempMotionVideoFile = File(tempMotionPhotoFile.absolutePath.replace(".jpg", ".mp4"))
+                            var videoUri: Uri? = null
                             try {
-                                if (metadata.usesSystemCaptureStorage && tempMotionVideoFile.length() <= 0L) {
-                                    discardPhotoExportUri(context, exportedPhotoUri)
-                                    throw IOException("实况合成未生成有效视频: $id")
+                                check(tempMotionVideoFile.isFile && tempMotionVideoFile.length() > 0L) {
+                                    "实况合成未生成有效视频: $id"
                                 }
-                                if (tempMotionVideoFile.exists()) {
-                                    val videoUri = exportFileToConfiguredPhotoStorage(
-                                        context = context,
-                                        destination = exportDestination,
-                                        collectionUri = MediaStore.Video.Media.EXTERNAL_CONTENT_URI,
-                                        displayName = videoFilename,
-                                        mimeType = "video/mp4",
-                                        sourceFile = tempMotionVideoFile,
-                                        dateTaken = date,
-                                    )
-                                    if (videoUri == null && metadata.usesSystemCaptureStorage) {
-                                        discardPhotoExportUri(context, exportedPhotoUri)
-                                        throw IOException("实况视频发布失败: $id")
-                                    }
-                                    videoUri?.let {
-                                        val updated = updateMetadata(context, id) { current ->
-                                            current.copy(
-                                                exportedUris = current.exportedUris + videoUri.toString()
-                                            )
-                                        }
-                                        if (updated == null && metadata.usesSystemCaptureStorage) {
-                                            discardPhotoExportUri(context, videoUri)
-                                            discardPhotoExportUri(context, exportedPhotoUri)
-                                            throw IOException("实况视频登记失败: $id")
-                                        }
-                                    }
+                                videoUri = exportFileToConfiguredPhotoStorage(
+                                    context = context,
+                                    destination = exportDestination,
+                                    collectionUri = MediaStore.Video.Media.EXTERNAL_CONTENT_URI,
+                                    displayName = videoFilename,
+                                    mimeType = "video/mp4",
+                                    sourceFile = tempMotionVideoFile,
+                                    dateTaken = date,
+                                    publishImmediately = false,
+                                ) ?: throw IOException("实况视频写入失败: $id")
+                                val updated = updateMetadata(context, id) { current ->
+                                    current.copy(exportedUris = (current.exportedUris + videoUri.toString()).distinct())
                                 }
+                                checkNotNull(updated) { "实况视频登记失败: $id" }
+                                // 两个文件写完后先发布视频，最后发布照片，图库看到封面时配对文件已就绪。
+                                check(publishPhotoExportUri(context, exportDestination, videoUri)) {
+                                    "实况视频发布失败: $id"
+                                }
+                                check(publishPhotoExportUri(context, exportDestination, exportedPhotoUri)) {
+                                    "实况照片发布失败: $id"
+                                }
+                            } catch (error: Exception) {
+                                videoUri?.let { discardPhotoExportUri(context, it) }
+                                discardPhotoExportUri(context, exportedPhotoUri)
+                                throw error
                             } finally {
                                 tempMotionVideoFile.delete()
                             }

@@ -97,7 +97,6 @@ import com.hinnka.mycamera.utils.BuglyHelper
 import com.hinnka.mycamera.utils.DeviceUtil
 import com.hinnka.mycamera.utils.OrientationObserver
 import com.hinnka.mycamera.utils.PLog
-import com.hinnka.mycamera.utils.SystemGalleryLauncher
 import com.hinnka.mycamera.utils.StartupTrace
 import com.hinnka.mycamera.video.CaptureMode
 import com.hinnka.mycamera.viewmodel.CameraViewModel
@@ -638,20 +637,29 @@ fun NavigationHost(
     var openingCameraGallery by remember { mutableStateOf(false) }
     fun openCameraGallery() {
         if (openingCameraGallery) return
-        val captured = cameraViewModel.capturedThumbnail.value?.takeUnless { it.finalThumbnailLoaded }
-        val photoId = captured?.savedPhotoId ?: captured?.photoId
-        val latest = galleryViewModel.latestPhoto.value
-        val photo = if (photoId == null) latest else {
-            latest?.takeIf { it.id == photoId }
-                ?: galleryViewModel.photos.value.firstOrNull { it.id == photoId }
-                ?: galleryViewModel.processingPhotos.value[photoId]?.photo
-        }
+        val pendingId = cameraViewModel.capturedThumbnail.value
+            ?.takeUnless { it.finalThumbnailLoaded }
+            ?.let { captured ->
+                captured.savedPhotoId ?: captured.photoId.takeIf {
+                    it in GalleryManager.processingPhotos.value ||
+                        it in galleryViewModel.processingPhotos.value
+                }
+            }
+        val latestPhoto = galleryViewModel.latestPhoto.value
+        val photoId = pendingId ?: latestPhoto?.takeIf {
+            !cameraViewModel.isExpanded && System.currentTimeMillis() - it.dateAdded < 3 * 60 * 1000
+        }?.id
         openingCameraGallery = true
         scope.launch {
             try {
-                if (!SystemGalleryLauncher.openPhoto(context, photo)) {
-                    // 无成片或系统图库不支持预览时，进入应用内的系统相册。
-                    galleryViewModel.selectTab(GalleryTab.SYSTEM)
+                // 相机入口始终回到光子相册，处理中条目由原有详情页跟随成片更新。
+                galleryViewModel.selectTab(GalleryTab.PHOTON)
+                if (photoId != null) {
+                    galleryViewModel.setCurrentPhotoById(photoId)
+                    navController.navigate(Routes.photoDetail(GalleryTab.PHOTON, photoId = photoId)) {
+                        launchSingleTop = true
+                    }
+                } else {
                     navController.navigate(Routes.GALLERY) { launchSingleTop = true }
                 }
             } finally {

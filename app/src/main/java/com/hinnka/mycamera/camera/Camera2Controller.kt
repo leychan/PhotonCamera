@@ -756,8 +756,8 @@ class Camera2Controller(private val context: Context) {
         }
         shot.livePhotoStartTimestampUs = livePhotoVideoStartTimestampUs
         val captureSurface = shot.reader.surface
-        val includesStabilizationOutput = shot.state.useLivePhoto &&
-            !shot.continuousBurst && stabilizationImageReader != null
+        val includesStabilizationOutput = !shot.continuousBurst &&
+            shouldIncludeLivePhotoPreview(shot.reader, shot.state) && stabilizationImageReader != null
         // Sum the actual request plan so HDR frames with different exposures contribute
         // their own duration. Keep one timeline for the entire photo, including frame gaps.
         val estimatedDurationNs = requests.sumOf { request ->
@@ -7979,19 +7979,24 @@ class Camera2Controller(private val context: Context) {
         )
     }
 
+    private fun shouldIncludeLivePhotoPreview(reader: ImageReader, state: CameraState): Boolean =
+        state.useLivePhoto && !isRawCaptureReader(reader)
+
     private fun createPhotoCaptureRequestBuilder(
         device: CameraDevice,
         reader: ImageReader,
         state: CameraState,
     ): CaptureRequest.Builder {
-        val template = if (state.useLivePhoto) {
+        // RAW 抓拍与实况预览使用独立请求，避免 RAW 手动曝光设置进入预览 ISP。
+        val includeLivePreview = shouldIncludeLivePhotoPreview(reader, state)
+        val template = if (includeLivePreview) {
             CameraDevice.TEMPLATE_VIDEO_SNAPSHOT
         } else {
             CameraDevice.TEMPLATE_STILL_CAPTURE
         }
         return device.createCaptureRequest(template).apply {
             addTarget(reader.surface)
-            if (state.useLivePhoto) {
+            if (includeLivePreview) {
                 // 编码器消费经过 LUT 渲染的预览纹理，需持续输出包括 EIS YUV 在内的所有预览流。
                 // OES 输出使用视频抓拍意图；普通静态拍照请求受 HAL 缓冲兼容性限制，仍只输出照片。
                 val preview = checkNotNull(previewRequestBuilder)

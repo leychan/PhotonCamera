@@ -23,13 +23,6 @@
             android:name="android.hardware.camera.autofocus"
             android:required="false" />
 
-    <queries>
-        <intent>
-            <action android:name="android.intent.action.MAIN" />
-            <category android:name="android.intent.category.APP_GALLERY" />
-        </intent>
-    </queries>
-
     <application
             android:name=".MyCameraApplication"
             android:allowBackup="true"
