@@ -520,11 +520,9 @@ internal class GlesMgcSpatialRgbChromaPostprocessor(
 
     private fun dispatchIir(axis: Int, label: String) {
         beginTrackedPass(label)
-        if (axis == 0) {
-            GLES31.glDispatchCompute(1, imageHeight, 1)
-        } else {
-            GLES31.glDispatchCompute(imageWidth, 1, 1)
-        }
+        // 每个线程独立顺序扫描一整行或整列；仅将独立扫描线打包到同一工作组。
+        val lines = if (axis == 0) imageHeight else imageWidth
+        GLES31.glDispatchCompute(GlesComputeWorkGroup.linearGroupCount(lines), 1, 1)
         GlesGpuScheduler.memoryBarrier()
         backend.checkGlError("MGC Spatial RGB chroma $label")
         clearImageBindings()
@@ -1110,7 +1108,7 @@ internal object GlesMgcSpatialRgbChromaShaders {
         precision highp float;
         precision highp int;
         precision highp uimage2D;
-        layout(local_size_x = 1, local_size_y = 1) in;
+        layout(local_size_x = ${GlesComputeWorkGroup.LINEAR_SIZE}, local_size_y = 1) in;
 
         layout(rgba16ui, binding = 0) readonly uniform highp uimage2D uInput;
         layout(rgba16ui, binding = 1) writeonly uniform highp uimage2D uOutput;
@@ -1178,7 +1176,7 @@ internal object GlesMgcSpatialRgbChromaShaders {
         }
 
         void main() {
-            int outer = uAxis == 0 ? int(gl_GlobalInvocationID.y) : int(gl_GlobalInvocationID.x);
+            int outer = int(gl_GlobalInvocationID.x);
             int outerLimit = uAxis == 0 ? uImageSize.y : uImageSize.x;
             int innerSize = uAxis == 0 ? uImageSize.x : uImageSize.y;
             if (outer >= outerLimit) return;
@@ -1232,7 +1230,7 @@ internal object GlesMgcSpatialRgbChromaShaders {
         precision highp float;
         precision highp int;
         precision highp uimage2D;
-        layout(local_size_x = 1, local_size_y = 1) in;
+        layout(local_size_x = ${GlesComputeWorkGroup.LINEAR_SIZE}, local_size_y = 1) in;
 
         layout(rgba16ui, binding = 0) readonly uniform highp uimage2D uInput;
         layout(rgba16ui, binding = 1) writeonly uniform highp uimage2D uOutput;
@@ -1272,7 +1270,7 @@ internal object GlesMgcSpatialRgbChromaShaders {
         }
 
         void main() {
-            int outer = uAxis == 0 ? int(gl_GlobalInvocationID.y) : int(gl_GlobalInvocationID.x);
+            int outer = int(gl_GlobalInvocationID.x);
             int outerLimit = uAxis == 0 ? uImageSize.y : uImageSize.x;
             int innerSize = uAxis == 0 ? uImageSize.x : uImageSize.y;
             if (outer >= outerLimit) return;

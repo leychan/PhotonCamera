@@ -832,80 +832,98 @@ object GalleryManager {
 
     private fun readVideoRecordInfo(context: Context, uri: Uri): VideoRecordInfo? {
         return try {
-            val projection = arrayOf(
-                MediaStore.Video.Media.DISPLAY_NAME,
-                MediaStore.Video.Media.DATE_ADDED,
-                MediaStore.Video.Media.SIZE,
-                MediaStore.Video.Media.WIDTH,
-                MediaStore.Video.Media.HEIGHT,
-                MediaStore.Video.Media.DURATION,
-                MediaStore.Video.Media.MIME_TYPE
-            )
-            context.contentResolver.query(uri, projection, null, null, null)?.use { cursor ->
-                if (!cursor.moveToFirst()) return@use null
-                val displayName = cursor.getString(cursor.getColumnIndexOrThrow(MediaStore.Video.Media.DISPLAY_NAME))
-                val dateTaken = cursor.getLong(cursor.getColumnIndexOrThrow(MediaStore.Video.Media.DATE_ADDED)) * 1000L
-                val size = cursor.getLong(cursor.getColumnIndexOrThrow(MediaStore.Video.Media.SIZE))
-                val width = cursor.getInt(cursor.getColumnIndexOrThrow(MediaStore.Video.Media.WIDTH))
-                val height = cursor.getInt(cursor.getColumnIndexOrThrow(MediaStore.Video.Media.HEIGHT))
-                val durationMs = cursor.getLong(cursor.getColumnIndexOrThrow(MediaStore.Video.Media.DURATION))
-                val mimeType = cursor.getString(cursor.getColumnIndexOrThrow(MediaStore.Video.Media.MIME_TYPE))
-
-                var frameRate: Int? = null
-                var bitrate: Long? = null
-                var rotationDegrees: Int? = null
-                var hasAudio: Boolean? = null
-                var resolvedWidth = width
-                var resolvedHeight = height
-                var resolvedDurationMs = durationMs
-
-                val retriever = MediaMetadataRetriever()
-                try {
-                    retriever.setDataSource(context, uri)
-                    resolvedWidth = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_WIDTH)
-                        ?.toIntOrNull()
-                        ?.takeIf { it > 0 } ?: resolvedWidth
-                    resolvedHeight = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_HEIGHT)
-                        ?.toIntOrNull()
-                        ?.takeIf { it > 0 } ?: resolvedHeight
-                    resolvedDurationMs = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)
-                        ?.toLongOrNull()
-                        ?.takeIf { it > 0L } ?: resolvedDurationMs
-                    frameRate = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_CAPTURE_FRAMERATE)
-                        ?.toFloatOrNull()?.roundToInt()
-                    if (frameRate == null) {
-                        val frameCount = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_FRAME_COUNT)
-                            ?.toLongOrNull()
-                        if (frameCount != null && resolvedDurationMs > 0L) {
-                            frameRate = ((frameCount * 1000f) / resolvedDurationMs).roundToInt().takeIf { it > 0 }
-                        }
-                    }
-                    bitrate = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_BITRATE)?.toLongOrNull()
-                    rotationDegrees = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_ROTATION)?.toIntOrNull()
-                    hasAudio = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_HAS_AUDIO)?.let {
-                        it == "yes" || it == "true" || it == "1"
-                    }
-                } catch (e: Exception) {
-                    PLog.w(TAG, "Video retriever metadata unavailable for $uri: ${e.message}")
-                } finally {
-                    retriever.release()
-                }
-
-                VideoRecordInfo(
-                    uri = uri,
-                    displayName = displayName,
-                    dateTaken = dateTaken,
-                    size = size,
-                    width = resolvedWidth,
-                    height = resolvedHeight,
-                    durationMs = resolvedDurationMs,
-                    mimeType = mimeType,
-                    frameRate = frameRate,
-                    bitrate = bitrate,
-                    rotationDegrees = rotationDegrees,
-                    hasAudio = hasAudio
+            var displayName: String
+            var dateTaken: Long
+            var size: Long
+            var width = 0
+            var height = 0
+            var durationMs = 0L
+            var mimeType: String?
+            if (uri.scheme == "file") {
+                // 私有缓存视频尚未进入媒体库，直接读取文件和容器元数据。
+                val file = uri.path?.let(::File)?.takeIf { it.isFile } ?: return null
+                displayName = file.name
+                dateTaken = file.lastModified()
+                size = file.length()
+                mimeType = null
+            } else {
+                val projection = arrayOf(
+                    MediaStore.Video.Media.DISPLAY_NAME,
+                    MediaStore.Video.Media.DATE_ADDED,
+                    MediaStore.Video.Media.SIZE,
+                    MediaStore.Video.Media.WIDTH,
+                    MediaStore.Video.Media.HEIGHT,
+                    MediaStore.Video.Media.DURATION,
+                    MediaStore.Video.Media.MIME_TYPE
                 )
+                val cursor = context.contentResolver.query(uri, projection, null, null, null) ?: return null
+                cursor.use {
+                    if (!it.moveToFirst()) return null
+                    displayName = it.getString(it.getColumnIndexOrThrow(MediaStore.Video.Media.DISPLAY_NAME))
+                    dateTaken = it.getLong(it.getColumnIndexOrThrow(MediaStore.Video.Media.DATE_ADDED)) * 1000L
+                    size = it.getLong(it.getColumnIndexOrThrow(MediaStore.Video.Media.SIZE))
+                    width = it.getInt(it.getColumnIndexOrThrow(MediaStore.Video.Media.WIDTH))
+                    height = it.getInt(it.getColumnIndexOrThrow(MediaStore.Video.Media.HEIGHT))
+                    durationMs = it.getLong(it.getColumnIndexOrThrow(MediaStore.Video.Media.DURATION))
+                    mimeType = it.getString(it.getColumnIndexOrThrow(MediaStore.Video.Media.MIME_TYPE))
+                }
             }
+
+            var frameRate: Int? = null
+            var bitrate: Long? = null
+            var rotationDegrees: Int? = null
+            var hasAudio: Boolean? = null
+            var resolvedWidth = width
+            var resolvedHeight = height
+            var resolvedDurationMs = durationMs
+
+            val retriever = MediaMetadataRetriever()
+            try {
+                retriever.setDataSource(context, uri)
+                mimeType = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_MIMETYPE) ?: mimeType
+                resolvedWidth = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_WIDTH)
+                    ?.toIntOrNull()
+                    ?.takeIf { it > 0 } ?: resolvedWidth
+                resolvedHeight = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_HEIGHT)
+                    ?.toIntOrNull()
+                    ?.takeIf { it > 0 } ?: resolvedHeight
+                resolvedDurationMs = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)
+                    ?.toLongOrNull()
+                    ?.takeIf { it > 0L } ?: resolvedDurationMs
+                frameRate = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_CAPTURE_FRAMERATE)
+                    ?.toFloatOrNull()?.roundToInt()
+                if (frameRate == null) {
+                    val frameCount = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_FRAME_COUNT)
+                        ?.toLongOrNull()
+                    if (frameCount != null && resolvedDurationMs > 0L) {
+                        frameRate = ((frameCount * 1000f) / resolvedDurationMs).roundToInt().takeIf { it > 0 }
+                    }
+                }
+                bitrate = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_BITRATE)?.toLongOrNull()
+                rotationDegrees = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_ROTATION)?.toIntOrNull()
+                hasAudio = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_HAS_AUDIO)?.let {
+                    it == "yes" || it == "true" || it == "1"
+                }
+            } catch (e: Exception) {
+                PLog.w(TAG, "Video retriever metadata unavailable for $uri: ${e.message}")
+            } finally {
+                retriever.release()
+            }
+
+            VideoRecordInfo(
+                uri = uri,
+                displayName = displayName,
+                dateTaken = dateTaken,
+                size = size,
+                width = resolvedWidth,
+                height = resolvedHeight,
+                durationMs = resolvedDurationMs,
+                mimeType = mimeType,
+                frameRate = frameRate,
+                bitrate = bitrate,
+                rotationDegrees = rotationDegrees,
+                hasAudio = hasAudio
+            )
         } catch (e: Exception) {
             PLog.e(TAG, "Failed to read video record info: $uri", e)
             null

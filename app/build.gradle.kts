@@ -17,6 +17,11 @@ val localProperties = Properties().apply {
 fun String.toBuildConfigString(): String =
     "\"${replace("\\", "\\\\").replace("\"", "\\\"")}\""
 
+// 最高两层固定分块，保留构建属性用于性能对照，不在拍摄时自动切换。
+val photonSynthesisTileHeight = providers.gradleProperty("photonSynthesisTileHeight")
+    .map(String::toInt).getOrElse(8)
+require(photonSynthesisTileHeight == 8 || photonSynthesisTileHeight == 16)
+
 android {
     namespace = "com.hinnka.mycamera"
     compileSdk = 36
@@ -28,6 +33,7 @@ android {
         targetSdk = 36
         versionCode = 168
         versionName = "1.28.6"
+        buildConfigField("int", "PHOTON_SYNTHESIS_TILE_HEIGHT", photonSynthesisTileHeight.toString())
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         

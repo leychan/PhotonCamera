@@ -12,6 +12,39 @@ import com.hinnka.mycamera.raw.RawDenoiseHistory
  */
 internal object PhotonDenoiseShaders {
     private const val LOCAL = GlesComputeWorkGroup.IMAGE_TILE_SIZE
+    const val SYNTHESIS_TILE_WIDTH = LOCAL
+    const val SYNTHESIS_TILE_HEIGHT = LOCAL * 2
+
+    /** 分离引导生成和重建时，仍复用完全相同的像素计算与半精度舍入。 */
+    enum class SynthesisStage { FUSED, PILOT, FINAL }
+
+    /** 只专门化原有开关，不改变降噪强度、阈值或数值精度。 */
+    data class SynthesisVariant(
+        val luma: Boolean,
+        val chroma: Boolean,
+        val bilateral: Boolean,
+        val inputOutput: Boolean,
+        val tileHeight: Int = SYNTHESIS_TILE_HEIGHT,
+        val interior: Boolean = false,
+        val stage: SynthesisStage = SynthesisStage.FUSED,
+    ) {
+        init {
+            require(!bilateral || chroma)
+            require(tileHeight == 8 || tileHeight == 16)
+            require(stage == SynthesisStage.FUSED || luma)
+        }
+
+        val label: String
+            get() = "l${luma.toInt()}c${chroma.toInt()}b${bilateral.toInt()}f${inputOutput.toInt()}" +
+                "i${interior.toInt()}t${SYNTHESIS_TILE_WIDTH}x$tileHeight" +
+                when (stage) {
+                    SynthesisStage.FUSED -> ""
+                    SynthesisStage.PILOT -> "_pilot"
+                    SynthesisStage.FINAL -> "_final"
+                }
+    }
+
+    private fun Boolean.toInt() = if (this) 1 else 0
 
     // §5.1 strength table and estimate; mirrored by tools/photon_denoise/photon_denoise.py.
     const val STRENGTH_BINS = RawDenoiseHistory.STRENGTH_BINS
@@ -219,12 +252,11 @@ internal object PhotonDenoiseShaders {
     /**
      * Fused per-level synthesis: Band → Pilot → Final in one dispatch (§10.1).
      *
-     * A work group owns an 8×8 output tile. Band values (L, base, noise) are computed into shared
-     * memory for the tile plus a 4-pixel border, pilot values for the tile plus a 2-pixel border.
-     * Shared memory is addressed by image coordinate and every neighbourhood is mirrored first,
-     * exactly as in the unfused reference, so border pixels see the same values. L, base and pilot
-     * are stored as packed float16 bits, rounding them exactly as their textures were rounded in
-     * the unfused passes.
+     * 每个 8×8 线程组输出 8×8 或 8×16 像素；融合路径保留四像素 band 边界和两像素
+     * pilot 边界，共享内存保守计算分别为 9344 和 14208 字节，低于 16 KiB 最低保证。
+     * 分离路径只需两像素 band 边界：引导生成只计算核心，重建装载已生成的引导位。
+     * 安全内区直接使用邻域坐标，边缘仍镜像映射。
+     * L、base 和 pilot 保持原有整数打包半浮点位，保留非融合路径的纹理舍入边界。
      *
      * [debugOutputs] compiles the parity variant: instead of the result it writes band, base,
      * noise and pilot of the tile core (tools/photon_denoise/compare_passes.py); four images, the
@@ -481,16 +513,17 @@ internal object PhotonDenoiseShaders {
         }
     """.trimIndent()
 
-    fun synthesize(debugOutputs: Boolean): String = """
+    fun synthesize(debugOutputs: Boolean, variant: SynthesisVariant): String = """
         #version 310 es
         $COMMON
         $LENS_SHADING
         $WORKING
         uniform sampler2D uFine;
-        uniform int uFineIsInput;
+        const int uFineIsInput = ${variant.inputOutput.toInt()};
         uniform sampler2D uNoisyCoarse;
         uniform sampler2D uDenoisedCoarse;
         uniform ivec2 uSize;
+        uniform ivec2 uTileOffset;
         uniform ivec2 uCoarseSize;
         $UPSAMPLE
         $MODEL_NOISE
@@ -498,35 +531,48 @@ internal object PhotonDenoiseShaders {
         layout(std430, binding = 0) readonly buffer StrengthTable { float uStrength[]; };
         uniform float uOutlier;
         uniform float uAlpha;
-        uniform int uLumaEnabled;
+        const int uLumaEnabled = ${variant.luma.toInt()};
         uniform float uGrain;
-        uniform int uChromaEnabled;
+        const int uChromaEnabled = ${variant.chroma.toInt()};
         uniform float uChromaStrength;      // min(s, 1)
         uniform vec2 uGateLuma;
         uniform vec2 uGateChroma;
-        uniform int uBilateral;
+        const int uBilateral = ${variant.bilateral.toInt()};
         uniform float uBilateralLuma;
         uniform float uBilateralChroma;
-        uniform int uWriteOutput;           // level 0: camera RGB with gains restored
-        ${if (debugOutputs) DEBUG_IMAGES else RESULT_IMAGE}
+        const int uWriteOutput = ${variant.inputOutput.toInt()};
+        ${when {
+            variant.stage == SynthesisStage.PILOT ->
+                "layout(rgba16ui, binding = 0) writeonly uniform highp uimage2D uPilotBitsOut;"
+            debugOutputs -> DEBUG_IMAGES
+            else -> RESULT_IMAGE
+        }}
+        ${if (variant.stage == SynthesisStage.FINAL) "uniform highp usampler2D uPilotBits;" else ""}
 
-        const int TILE = $LOCAL;
-        const int BAND_BORDER = 4;
+        const int LANES = $LOCAL * $LOCAL;
+        const int TILE_WIDTH = $SYNTHESIS_TILE_WIDTH;
+        const int TILE_HEIGHT = ${variant.tileHeight};
+        const int BAND_BORDER = ${if (variant.stage == SynthesisStage.FUSED) 4 else 2};
         const int PILOT_BORDER = 2;
-        const int BAND_SIDE = TILE + 2 * BAND_BORDER;
-        const int PILOT_SIDE = TILE + 2 * PILOT_BORDER;
+        const int BAND_WIDTH = TILE_WIDTH + 2 * BAND_BORDER;
+        const int BAND_HEIGHT = TILE_HEIGHT + 2 * BAND_BORDER;
+        const int PILOT_WIDTH = TILE_WIDTH + 2 * PILOT_BORDER;
+        const int PILOT_HEIGHT = TILE_HEIGHT + 2 * PILOT_BORDER;
         const float BASE_RADIUS = 1.25;
 
         // L and base (six halves) and the pilot (four halves) are held as packed float16 bits.
         // Integer storage makes the float16 rounding unconditional: a compiler may legally fold
         // unpackHalf2x16(packHalf2x16(x)) back to x, which left unrounded values in a float array.
-        shared uvec3 sLapBase[BAND_SIDE * BAND_SIDE];
-        shared vec4 sNoise[BAND_SIDE * BAND_SIDE];
-        shared uvec2 sPilot[PILOT_SIDE * PILOT_SIDE];
+        shared uvec3 sLapBase[BAND_WIDTH * BAND_HEIGHT];
+        shared vec4 sNoise[BAND_WIDTH * BAND_HEIGHT];
+        shared uvec2 sPilot[PILOT_WIDTH * PILOT_HEIGHT];
 
-        ivec2 tileOrigin() { return groupId() * TILE; }
-        int bandIndex(ivec2 c) { ivec2 r = c - (tileOrigin() - BAND_BORDER); return r.y * BAND_SIDE + r.x; }
-        int pilotIndex(ivec2 c) { ivec2 r = c - (tileOrigin() - PILOT_BORDER); return r.y * PILOT_SIDE + r.x; }
+        ivec2 tileOrigin() { return (groupId() + uTileOffset) * ivec2(TILE_WIDTH, TILE_HEIGHT); }
+        int bandIndex(ivec2 c) { ivec2 r = c - (tileOrigin() - BAND_BORDER); return r.y * BAND_WIDTH + r.x; }
+        int pilotIndex(ivec2 c) { ivec2 r = c - (tileOrigin() - PILOT_BORDER); return r.y * PILOT_WIDTH + r.x; }
+
+        // 内区由调度器保证完整四像素邻域有效；边缘变体保留原镜像规则。
+        ivec2 sampleCoordinate(ivec2 p) { return ${if (variant.interior) "p" else "mirror2(p, uSize)"}; }
 
         // §5.1 (S_Y, S_Cb, S_Cr) of this level at base luma y: bins interpolated in log2(y / K).
         vec3 strengthAt(float y) {
@@ -555,16 +601,16 @@ internal object PhotonDenoiseShaders {
         }
 
         vec3 lapAt(ivec2 p) {
-            uvec3 u = sLapBase[bandIndex(mirror2(p, uSize))];
+            uvec3 u = sLapBase[bandIndex(sampleCoordinate(p))];
             return vec3(unpackHalf2x16(u.x), unpackHalf2x16(u.y).x);
         }
         vec3 baseAt(ivec2 p) {
-            uvec3 u = sLapBase[bandIndex(mirror2(p, uSize))];
+            uvec3 u = sLapBase[bandIndex(sampleCoordinate(p))];
             return vec3(unpackHalf2x16(u.y).y, unpackHalf2x16(u.z));
         }
-        vec4 noiseAt(ivec2 p) { return sNoise[bandIndex(mirror2(p, uSize))]; }
+        vec4 noiseAt(ivec2 p) { return sNoise[bandIndex(sampleCoordinate(p))]; }
         vec4 pilotAt(ivec2 p) {
-            uvec2 u = sPilot[pilotIndex(mirror2(p, uSize))];
+            uvec2 u = sPilot[pilotIndex(sampleCoordinate(p))];
             return vec4(unpackHalf2x16(u.x), unpackHalf2x16(u.y));
         }
 
@@ -590,7 +636,7 @@ internal object PhotonDenoiseShaders {
             float jyy = 0.0;
             for (int dy = -1; dy <= 1; ++dy) {
                 for (int dx = -1; dx <= 1; ++dx) {
-                    ivec2 q = mirror2(p + ivec2(dx, dy), uSize);
+                    ivec2 q = sampleCoordinate(p + ivec2(dx, dy));
                     float gx = 0.5 * (baseAt(q + ivec2(1, 0)).x - baseAt(q - ivec2(1, 0)).x);
                     float gy = 0.5 * (baseAt(q + ivec2(0, 1)).x - baseAt(q - ivec2(0, 1)).x);
                     jxx += gx * gx;
@@ -703,27 +749,46 @@ internal object PhotonDenoiseShaders {
         void main() {
             int lid = int(gl_LocalInvocationIndex);
             ivec2 origin = tileOrigin();
-            for (int i = lid; i < BAND_SIDE * BAND_SIDE; i += TILE * TILE) {
-                ivec2 c = origin - BAND_BORDER + ivec2(i % BAND_SIDE, i / BAND_SIDE);
+            for (int i = lid; i < BAND_WIDTH * BAND_HEIGHT; i += LANES) {
+                ivec2 c = origin - BAND_BORDER + ivec2(i % BAND_WIDTH, i / BAND_WIDTH);
                 if (all(greaterThanEqual(c, ivec2(0))) && all(lessThan(c, uSize))) computeBand(c);
             }
             memoryBarrierShared();
             barrier();
+            ${if (variant.stage == SynthesisStage.PILOT) """
+            // 仅计算分块核心，每个有效像素恰好写一次；以整数位保存原有半精度舍入。
+            for (int i = lid; i < TILE_WIDTH * TILE_HEIGHT; i += LANES) {
+                ivec2 p = origin + ivec2(i % TILE_WIDTH, i / TILE_WIDTH);
+                if (any(greaterThanEqual(p, uSize))) continue;
+                vec4 pilot = computePilot(p);
+                uvec2 bits = uvec2(packHalf2x16(pilot.xy), packHalf2x16(pilot.zw));
+                imageStore(uPilotBitsOut, p, uvec4(bits.x & 65535u, bits.x >> 16,
+                    bits.y & 65535u, bits.y >> 16));
+            }
+            """ else """
             if (uLumaEnabled == 1) {
-                for (int i = lid; i < PILOT_SIDE * PILOT_SIDE; i += TILE * TILE) {
-                    ivec2 c = origin - PILOT_BORDER + ivec2(i % PILOT_SIDE, i / PILOT_SIDE);
+                for (int i = lid; i < PILOT_WIDTH * PILOT_HEIGHT; i += LANES) {
+                    ivec2 c = origin - PILOT_BORDER + ivec2(i % PILOT_WIDTH, i / PILOT_WIDTH);
                     if (all(greaterThanEqual(c, ivec2(0))) && all(lessThan(c, uSize))) {
+                        ${if (variant.stage == SynthesisStage.FINAL) """
+                        uvec4 bits = texelFetch(uPilotBits, c, 0);
+                        sPilot[pilotIndex(c)] = uvec2(bits.x | (bits.y << 16), bits.z | (bits.w << 16));
+                        """ else """
                         vec4 pilot = computePilot(c);
                         sPilot[pilotIndex(c)] = uvec2(packHalf2x16(pilot.xy), packHalf2x16(pilot.zw));
+                        """}
                     }
                 }
             }
             memoryBarrierShared();
             barrier();
 
-            ivec2 p = globalId();
-            if (any(greaterThanEqual(p, uSize))) return;
-            ${if (debugOutputs) DEBUG_STORE else RESULT_STORE}
+            for (int i = lid; i < TILE_WIDTH * TILE_HEIGHT; i += LANES) {
+                ivec2 p = origin + ivec2(i % TILE_WIDTH, i / TILE_WIDTH);
+                if (any(greaterThanEqual(p, uSize))) continue;
+                ${if (debugOutputs) DEBUG_STORE else RESULT_STORE}
+            }
+            """}
         }
     """.trimIndent()
 }

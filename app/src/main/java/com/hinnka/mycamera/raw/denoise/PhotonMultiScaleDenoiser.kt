@@ -2,6 +2,7 @@ package com.hinnka.mycamera.raw.denoise
 
 import android.opengl.GLES30
 import android.opengl.GLES31
+import com.hinnka.mycamera.BuildConfig
 import com.hinnka.mycamera.processor.GlesComputeWorkGroup
 import com.hinnka.mycamera.processor.GlesGpuScheduler
 import com.hinnka.mycamera.raw.RawDenoiseHistory
@@ -13,11 +14,10 @@ import java.nio.ByteOrder
  * GLES orchestration of the Photon denoiser (docs/photon-multiscale-denoise.md §4.3, §10).
  *
  * Analyze builds G_1..G_N (G_0 is computed from the input on the fly); the §5.1 strength table is
- * then estimated from G_0..G_N unless the params carry one; synthesis runs the fused
- * Band → Pilot → Final dispatch per level from coarse to fine, and level 0 writes camera RGB with
- * the LSC gains restored. Only the Gaussian levels and two adjacent denoised levels are held
- * (§10.2). A [PassSink] receives every pass output for parity checks; it adds a parity dispatch
- * per level that emits the fused pass's band, base, noise and pilot tiles.
+ * then estimated from G_0..G_N unless the params carry one.
+ * 重建从粗到细执行，最高两层先生成可复用的引导结果，其余层沿用融合式重建。
+ * 第零层恢复相机 RGB 和 LSC；临时引导纹理由两层共用，随本次处理释放。
+ * [PassSink] 额外导出各层的 band、base、noise 和 pilot，供输出一致性验证。
  */
 internal class PhotonMultiScaleDenoiser {
     /** Receives pass outputs while their textures are alive (debug parity, §12.4). */
@@ -29,35 +29,46 @@ internal class PhotonMultiScaleDenoiser {
     }
 
     private var analyzeProgram = 0
-    private var synthesizeProgram = 0
-    private var synthesizeDebugProgram = 0
+    private val synthesizePrograms = HashMap<PhotonDenoiseShaders.SynthesisVariant, Int>()
+    private val synthesizeDebugPrograms = HashMap<PhotonDenoiseShaders.SynthesisVariant, Int>()
     private var estimateProgram = 0
     private var resolveProgram = 0
 
-    fun initialize(debug: Boolean = false): Boolean {
+    fun initialize(): Boolean {
         if (analyzeProgram == 0) analyzeProgram = RawGlesProgram.compileCompute(PhotonDenoiseShaders.ANALYZE, "PhotonDenoiseAnalyze")
-        if (synthesizeProgram == 0) {
-            synthesizeProgram = RawGlesProgram.compileCompute(PhotonDenoiseShaders.synthesize(false), "PhotonDenoiseSynthesize")
-        }
         if (estimateProgram == 0) estimateProgram = RawGlesProgram.compileCompute(PhotonDenoiseShaders.ESTIMATE, "PhotonDenoiseEstimate")
         if (resolveProgram == 0) resolveProgram = RawGlesProgram.compileCompute(PhotonDenoiseShaders.RESOLVE, "PhotonDenoiseResolve")
-        if (debug && synthesizeDebugProgram == 0) {
-            synthesizeDebugProgram =
-                RawGlesProgram.compileCompute(PhotonDenoiseShaders.synthesize(true), "PhotonDenoiseSynthesizeDebug")
-        }
-        return analyzeProgram != 0 && synthesizeProgram != 0 && estimateProgram != 0 && resolveProgram != 0 &&
-            (!debug || synthesizeDebugProgram != 0)
+        return analyzeProgram != 0 && estimateProgram != 0 && resolveProgram != 0
     }
 
     fun release() {
-        intArrayOf(analyzeProgram, synthesizeProgram, synthesizeDebugProgram, estimateProgram, resolveProgram).forEach {
+        (listOf(analyzeProgram, estimateProgram, resolveProgram) +
+            synthesizePrograms.values + synthesizeDebugPrograms.values).forEach {
             if (it != 0) GLES31.glDeleteProgram(it)
         }
         analyzeProgram = 0
-        synthesizeProgram = 0
-        synthesizeDebugProgram = 0
+        synthesizePrograms.clear()
+        synthesizeDebugPrograms.clear()
         estimateProgram = 0
         resolveProgram = 0
+    }
+
+    private fun synthesisVariant(level: Int, params: PhotonDenoiseParams) =
+        PhotonDenoiseShaders.SynthesisVariant(
+            luma = level < params.lumaLevels && params.lumaStrength > 0f,
+            chroma = params.chromaStrength > 0f,
+            bilateral = params.chromaStrength > 0f && level >= params.levels - params.bilateralLevels,
+            inputOutput = level == 0,
+            tileHeight = if (level <= 1) BuildConfig.PHOTON_SYNTHESIS_TILE_HEIGHT
+                else PhotonDenoiseShaders.SYNTHESIS_TILE_HEIGHT,
+        )
+
+    private fun synthesisProgram(variant: PhotonDenoiseShaders.SynthesisVariant, debug: Boolean): Int {
+        val cache = if (debug) synthesizeDebugPrograms else synthesizePrograms
+        return cache[variant] ?: RawGlesProgram.compileCompute(
+            PhotonDenoiseShaders.synthesize(debug, variant),
+            "PhotonDenoiseSynthesize_${variant.label}_${if (debug) "debug" else "result"}",
+        ).also { if (it != 0) cache[variant] = it }
     }
 
     /**
@@ -73,10 +84,35 @@ internal class PhotonMultiScaleDenoiser {
         strengthOut: FloatArray? = null,
         sink: PassSink? = null,
     ): Int? {
-        if (!initialize(debug = sink != null)) return null
+        if (!initialize()) return null
+        val variants = List(params.levels) { level ->
+            val variant = synthesisVariant(level, params)
+            if (level <= 1 && variant.luma) variant.copy(stage = PhotonDenoiseShaders.SynthesisStage.FINAL)
+            else variant
+        }
         val sizes = ArrayList<IntArray>(params.levels + 1)
         sizes += intArrayOf(width, height)
         repeat(params.levels) { val s = sizes.last(); sizes += intArrayOf((s[0] + 1) / 2, (s[1] + 1) / 2) }
+        val regions = variants.mapIndexed { level, variant ->
+            PhotonSynthesisDispatch.regions(sizes[level][0], sizes[level][1], variant.tileHeight,
+                splitInterior = level <= 1).groupBy { it.interior }
+        }
+        val requiredVariants = variants.flatMapIndexed { level, variant ->
+            regions[level].keys.flatMap { interior ->
+                val regionVariant = variant.copy(interior = interior)
+                if (variant.stage == PhotonDenoiseShaders.SynthesisStage.FINAL) {
+                    listOf(regionVariant, regionVariant.copy(stage = PhotonDenoiseShaders.SynthesisStage.PILOT))
+                } else listOf(regionVariant)
+            }
+        }.distinct()
+        // 在提交金字塔之前准备本次实际需要的变体，避免在逐层重建期间编译。
+        for (variant in requiredVariants) {
+            if (synthesisProgram(variant, false) == 0) return null
+            if (sink != null && variant.stage != PhotonDenoiseShaders.SynthesisStage.PILOT &&
+                synthesisProgram(variant, true) == 0) return null
+        }
+        val firstPilotLevel = variants.indexOfFirst { it.stage == PhotonDenoiseShaders.SynthesisStage.FINAL }
+        val pilotSize = if (firstPilotLevel >= 0) sizes[firstPilotLevel] else null
         val owned = ArrayList<Int>()
         fun texture(size: IntArray, format: Int) = createTexture(size[0], size[1], format).also(owned::add)
         val lscTexture = params.lensShading?.let { createLscTexture(it).also(owned::add) } ?: 0
@@ -98,7 +134,7 @@ internal class PhotonMultiScaleDenoiser {
                 uniform2i(analyzeProgram, "uFineSize", sizes[level])
                 uniform2i(analyzeProgram, "uCoarseSize", coarse)
                 bindImage(0, gaussians[level + 1], GLES30.GL_RGBA16F)
-                dispatch(analyzeProgram, coarse)
+                dispatch(coarse)
                 GlesGpuScheduler.yieldToUiRenderer()
                 sink?.onPass("G${level + 1}", gaussians[level + 1], coarse[0], coarse[1], false)
             }
@@ -119,25 +155,48 @@ internal class PhotonMultiScaleDenoiser {
             }
             GLES31.glBindBufferBase(GLES31.GL_SHADER_STORAGE_BUFFER, 0, strengthBuffer)
 
+            // 同一 GL 队列按序先读后写，各层仅使用自己的有效矩形，无需清空或 CPU 等待。
+            val pilotTexture = pilotSize?.let { texture(it, GLES30.GL_RGBA16UI) } ?: 0
             var denoisedCoarse = gaussians[params.levels]
             for (level in params.levels - 1 downTo 0) {
                 val size = sizes[level]
-                val lumaEnabled = level < params.lumaLevels && params.lumaStrength > 0f
+                val variant = variants[level]
+                val lumaEnabled = variant.luma
+                fun synthesize(
+                    debug: Boolean,
+                    outputs: List<Pair<Int, Int>>,
+                    stage: PhotonDenoiseShaders.SynthesisStage = variant.stage,
+                ) {
+                    for ((interior, rectangles) in regions[level]) {
+                        val regionVariant = variant.copy(interior = interior, stage = stage)
+                        val program = synthesisProgram(regionVariant, debug)
+                        GLES31.glUseProgram(program)
+                        bindSynthesize(program, inputTexture, lscTexture, mergeTexture, gaussians,
+                            denoisedCoarse, sizes, level, params)
+                        if (stage == PhotonDenoiseShaders.SynthesisStage.FINAL) {
+                            bindSampler(program, "uPilotBits", UNIT_PILOT, pilotTexture)
+                        }
+                        outputs.forEachIndexed { unit, (texture, format) -> bindImage(unit, texture, format) }
+                        for (rectangle in rectangles) {
+                            GLES31.glUniform2i(location(program, "uTileOffset"), rectangle.x, rectangle.y)
+                            GLES31.glDispatchCompute(rectangle.width, rectangle.height, 1)
+                        }
+                        imageBarrier()
+                    }
+                }
+                if (variant.stage == PhotonDenoiseShaders.SynthesisStage.FINAL) {
+                    synthesize(false, listOf(pilotTexture to GLES30.GL_RGBA16UI),
+                        PhotonDenoiseShaders.SynthesisStage.PILOT)
+                    GlesGpuScheduler.yieldToUiRenderer()
+                }
                 if (sink != null) {
-                    // Parity variant: the same fused computation, emitting its band, base, noise
-                    // and pilot tiles instead of the result.
+                    // 诊断和正式输出共用本层引导缓存，不重复生成引导结果。
                     val band = texture(size, GLES30.GL_RGBA16F)
                     val base = texture(size, GLES30.GL_RGBA16F)
                     val noise = texture(size, GLES30.GL_RGBA32F)
                     val pilot = if (lumaEnabled) texture(size, GLES30.GL_RGBA16F) else band
-                    GLES31.glUseProgram(synthesizeDebugProgram)
-                    bindSynthesize(synthesizeDebugProgram, inputTexture, lscTexture, mergeTexture, gaussians,
-                        denoisedCoarse, sizes, level, lumaEnabled, params)
-                    bindImage(0, band, GLES30.GL_RGBA16F)
-                    bindImage(1, base, GLES30.GL_RGBA16F)
-                    bindImage(2, noise, GLES30.GL_RGBA32F)
-                    bindImage(3, pilot, GLES30.GL_RGBA16F)
-                    dispatch(synthesizeDebugProgram, size)
+                    synthesize(true, listOf(band to GLES30.GL_RGBA16F, base to GLES30.GL_RGBA16F,
+                        noise to GLES30.GL_RGBA32F, pilot to GLES30.GL_RGBA16F))
                     sink.onPass("band$level", band, size[0], size[1], false)
                     sink.onPass("base$level", base, size[0], size[1], false)
                     sink.onPass("noise$level", noise, size[0], size[1], true)
@@ -149,11 +208,7 @@ internal class PhotonMultiScaleDenoiser {
                 }
 
                 val result = if (level == 0) output else texture(size, GLES30.GL_RGBA16F)
-                GLES31.glUseProgram(synthesizeProgram)
-                bindSynthesize(synthesizeProgram, inputTexture, lscTexture, mergeTexture, gaussians,
-                    denoisedCoarse, sizes, level, lumaEnabled, params)
-                bindImage(0, result, GLES30.GL_RGBA16F)
-                dispatch(synthesizeProgram, size)
+                synthesize(false, listOf(result to GLES30.GL_RGBA16F))
                 GlesGpuScheduler.yieldToUiRenderer()
                 sink?.onPass(if (level == 0) "output" else "denoised$level", result, size[0], size[1], false)
 
@@ -301,33 +356,26 @@ internal class PhotonMultiScaleDenoiser {
         denoisedCoarse: Int,
         sizes: List<IntArray>,
         level: Int,
-        lumaEnabled: Boolean,
         params: PhotonDenoiseParams,
     ) {
         bindCommon(program, inputTexture, lscTexture, params)
         bindSampler(program, "uFine", UNIT_FINE, if (level == 0) inputTexture else gaussians[level])
         bindSampler(program, "uNoisyCoarse", UNIT_NOISY_COARSE, gaussians[level + 1])
         bindSampler(program, "uDenoisedCoarse", UNIT_DENOISED_COARSE, denoisedCoarse)
-        uniform1i(program, "uFineIsInput", if (level == 0) 1 else 0)
         uniform2i(program, "uSize", sizes[level])
         uniform2i(program, "uCoarseSize", sizes[level + 1])
         bindModelNoise(program, mergeTexture, level, params)
         uniform1f(program, "uOutlier", params.outlier[level])
         uniform1f(program, "uAlpha", params.lumaAlpha(level))
-        uniform1i(program, "uLumaEnabled", if (lumaEnabled) 1 else 0)
         uniform1f(program, "uGrain", params.lumaGrain(level))
-        val chromaEnabled = params.chromaStrength > 0f
-        uniform1i(program, "uChromaEnabled", if (chromaEnabled) 1 else 0)
         uniform1f(program, "uChromaStrength", minOf(params.chromaStrength, 1f))
         val thresholdScale = params.chromaThresholdScale()
         GLES31.glUniform2f(location(program, "uGateLuma"),
             params.gateLuma[0] * thresholdScale, params.gateLuma[1] * thresholdScale)
         GLES31.glUniform2f(location(program, "uGateChroma"),
             params.gateChroma[0] * thresholdScale, params.gateChroma[1] * thresholdScale)
-        uniform1i(program, "uBilateral", if (chromaEnabled && level >= params.levels - params.bilateralLevels) 1 else 0)
         uniform1f(program, "uBilateralLuma", params.bilateralLuma)
         uniform1f(program, "uBilateralChroma", params.bilateralChroma * thresholdScale)
-        uniform1i(program, "uWriteOutput", if (level == 0) 1 else 0)
     }
 
     private fun createTexture(width: Int, height: Int, format: Int): Int {
@@ -373,9 +421,13 @@ internal class PhotonMultiScaleDenoiser {
      * by the low-priority EGL context and a flush + yield between levels, never by fence waits
      * inside a level: those drain the GPU and leave it idle until this thread wakes up.
      */
-    private fun dispatch(program: Int, size: IntArray) {
+    private fun dispatch(size: IntArray) {
         GLES31.glDispatchCompute(GlesComputeWorkGroup.imageGroupCount(size[0]),
             GlesComputeWorkGroup.imageGroupCount(size[1]), 1)
+        imageBarrier()
+    }
+
+    private fun imageBarrier() {
         GLES31.glMemoryBarrier(
             GLES31.GL_SHADER_IMAGE_ACCESS_BARRIER_BIT or GLES31.GL_TEXTURE_FETCH_BARRIER_BIT or
                 GLES31.GL_FRAMEBUFFER_BARRIER_BIT,
@@ -407,5 +459,6 @@ internal class PhotonMultiScaleDenoiser {
         const val UNIT_NOISY_COARSE = 3
         const val UNIT_DENOISED_COARSE = 4
         const val UNIT_MERGE = 5
+        const val UNIT_PILOT = 6
     }
 }

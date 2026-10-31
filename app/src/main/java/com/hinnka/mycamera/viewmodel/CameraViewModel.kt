@@ -1980,6 +1980,8 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
     // 保存当前的 SurfaceTexture 以便切换摄像头时重用
     private var currentSurfaceTexture: SurfaceTexture? = null
     private var cameraOpenInFlight = false
+    private var cameraUiStarted = false
+    private var cameraSuspendedForBackground = false
     private var cameraReopenJob: Job? = null
     private var cameraErrorRecoveryJob: Job? = null
 
@@ -2920,7 +2922,8 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
      */
     fun openCamera(surfaceTexture: SurfaceTexture) {
         PLog.d(TAG, "openCamera")
-        if (currentSurfaceTexture === surfaceTexture && (state.value.isPreviewActive || cameraOpenInFlight)) {
+        if (!cameraSuspendedForBackground && currentSurfaceTexture === surfaceTexture &&
+            (state.value.isPreviewActive || cameraOpenInFlight)) {
             PLog.d(
                 TAG,
                 "openCamera skipped: same SurfaceTexture active=${state.value.isPreviewActive}, inFlight=$cameraOpenInFlight"
@@ -2936,16 +2939,39 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
         preserveVideoRecording: Boolean = false,
     ) {
         cameraReopenJob?.cancel()
+        if (!cameraUiStarted) {
+            cameraOpenInFlight = false
+            cameraSuspendedForBackground = true
+            return
+        }
         cameraOpenInFlight = true
         cameraReopenJob = viewModelScope.launch {
             isInitialized.first { it }
-            if (currentSurfaceTexture !== surfaceTexture) return@launch
+            if (!cameraUiStarted || currentSurfaceTexture !== surfaceTexture) return@launch
             syncVendorCaptureSettingsToController()
+            cameraSuspendedForBackground = false
             cameraController.openCamera(
                 surfaceTexture = surfaceTexture,
                 preserveVideoRecording = preserveVideoRecording,
             )
         }
+    }
+
+    /** STARTED 表示界面仍可见；画中画和分屏的暂停不会触发后台释放。 */
+    fun onCameraUiStarted() {
+        cameraUiStarted = true
+    }
+
+    /** 保留仍有效的预览 Surface，设备和录像按控制器原有的有序关闭流程释放。 */
+    fun onCameraUiStopped() {
+        cameraUiStarted = false
+        startupPrewarmJob?.cancel()
+        cameraErrorRecoveryJob?.cancel()
+        cameraReopenJob?.cancel()
+        val shouldClose = currentSurfaceTexture != null || cameraOpenInFlight || state.value.isPreviewActive
+        cameraOpenInFlight = false
+        cameraSuspendedForBackground = currentSurfaceTexture != null
+        if (shouldClose) cameraController.closeCamera()
     }
 
     suspend fun prepareCamera(): Boolean {
@@ -2979,6 +3005,7 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
         cameraReopenJob?.cancel()
         cameraOpenInFlight = false
         currentSurfaceTexture = null
+        cameraSuspendedForBackground = false
         cameraController.closeCamera(expectedSurfaceTexture = surfaceTexture)
     }
 
@@ -3103,13 +3130,14 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
      * 检查相机状态并在必要时恢复
      */
     fun checkAndRecoverCamera() {
+        if (!cameraUiStarted) return
         if (!state.value.isPreviewActive) {
             resetExposureCompensationForCameraRestart()
         }
 
         // 如果有保存的 SurfaceTexture，重新打开相机
         currentSurfaceTexture?.let { texture ->
-            if (!state.value.isPreviewActive && !cameraOpenInFlight) {
+            if (cameraSuspendedForBackground || (!state.value.isPreviewActive && !cameraOpenInFlight)) {
                 requestCameraOpen(texture)
             } else {
                 PLog.d(

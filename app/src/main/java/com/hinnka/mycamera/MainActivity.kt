@@ -40,6 +40,7 @@ import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -96,6 +97,7 @@ import com.hinnka.mycamera.utils.BuglyHelper
 import com.hinnka.mycamera.utils.DeviceUtil
 import com.hinnka.mycamera.utils.OrientationObserver
 import com.hinnka.mycamera.utils.PLog
+import com.hinnka.mycamera.utils.SystemGalleryLauncher
 import com.hinnka.mycamera.utils.StartupTrace
 import com.hinnka.mycamera.video.CaptureMode
 import com.hinnka.mycamera.viewmodel.CameraViewModel
@@ -362,6 +364,17 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    override fun onStart() {
+        super.onStart()
+        cameraViewModel.onCameraUiStarted()
+    }
+
+    override fun onStop() {
+        // 仅在界面完全不可见时释放实体相机；独立的屏幕捕获画中画不归这里管理。
+        cameraViewModel.onCameraUiStopped()
+        super.onStop()
+    }
+
     override fun onResume() {
         super.onResume()
     }
@@ -621,6 +634,31 @@ fun NavigationHost(
 ) {
     val context = LocalContext.current
     val navController = rememberNavController()
+    val scope = rememberCoroutineScope()
+    var openingCameraGallery by remember { mutableStateOf(false) }
+    fun openCameraGallery() {
+        if (openingCameraGallery) return
+        val captured = cameraViewModel.capturedThumbnail.value?.takeUnless { it.finalThumbnailLoaded }
+        val photoId = captured?.savedPhotoId ?: captured?.photoId
+        val latest = galleryViewModel.latestPhoto.value
+        val photo = if (photoId == null) latest else {
+            latest?.takeIf { it.id == photoId }
+                ?: galleryViewModel.photos.value.firstOrNull { it.id == photoId }
+                ?: galleryViewModel.processingPhotos.value[photoId]?.photo
+        }
+        openingCameraGallery = true
+        scope.launch {
+            try {
+                if (!SystemGalleryLauncher.openPhoto(context, photo)) {
+                    // 无成片或系统图库不支持预览时，进入应用内的系统相册。
+                    galleryViewModel.selectTab(GalleryTab.SYSTEM)
+                    navController.navigate(Routes.GALLERY) { launchSingleTop = true }
+                }
+            } finally {
+                openingCameraGallery = false
+            }
+        }
+    }
     val navBackStackEntry by navController.currentBackStackEntryAsState()
     val currentRoute = navBackStackEntry?.destination?.route
     val handleGalleryBack: () -> Unit = {
@@ -681,22 +719,7 @@ fun NavigationHost(
                         CameraScreen(
                             viewModel = cameraViewModel,
                             galleryViewModel = galleryViewModel,
-                            onGalleryClick = {
-                                val pendingId = cameraViewModel.capturedThumbnail.value
-                                    ?.takeUnless { it.finalThumbnailLoaded }
-                                    ?.let { captured ->
-                                        captured.savedPhotoId ?: captured.photoId.takeIf {
-                                            it in GalleryManager.processingPhotos.value ||
-                                                it in galleryViewModel.processingPhotos.value
-                                        }
-                                    }
-                                if (pendingId != null) {
-                                    galleryViewModel.setCurrentPhotoById(pendingId)
-                                    navController.navigate(Routes.photoDetail(photoId = pendingId))
-                                } else {
-                                    navController.navigate(Routes.GALLERY)
-                                }
-                            },
+                            onGalleryClick = ::openCameraGallery,
                             onSettingsClick = {
                                 navController.navigate(Routes.SETTINGS)
                             },
@@ -740,26 +763,7 @@ fun NavigationHost(
                     CameraScreen(
                         viewModel = cameraViewModel,
                         galleryViewModel = galleryViewModel,
-                        onGalleryClick = {
-                            val pendingId = cameraViewModel.capturedThumbnail.value
-                                ?.takeUnless { it.finalThumbnailLoaded }
-                                ?.let { captured ->
-                                    captured.savedPhotoId ?: captured.photoId.takeIf {
-                                        it in GalleryManager.processingPhotos.value ||
-                                            it in galleryViewModel.processingPhotos.value
-                                    }
-                                }
-                            val latestPhoto = galleryViewModel.latestPhoto.value
-                            if (pendingId != null) {
-                                galleryViewModel.setCurrentPhotoById(pendingId)
-                                navController.navigate(Routes.photoDetail(photoId = pendingId))
-                            } else if (latestPhoto != null && System.currentTimeMillis() - latestPhoto.dateAdded < 3 * 60 * 1000) {
-                                galleryViewModel.setCurrentPhotoById(latestPhoto.id)
-                                navController.navigate(Routes.photoDetail(photoId = latestPhoto.id))
-                            } else {
-                                navController.navigate(Routes.GALLERY)
-                            }
-                        },
+                        onGalleryClick = ::openCameraGallery,
                         onSettingsClick = {
                             navController.navigate(Routes.SETTINGS)
                         },
